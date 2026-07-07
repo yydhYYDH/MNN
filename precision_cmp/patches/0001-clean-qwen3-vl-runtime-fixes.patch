@@ -1,0 +1,1063 @@
+diff --git a/transformers/llm/engine/src/omni.cpp b/transformers/llm/engine/src/omni.cpp
+index 5adba3f9..9a4d4fe2 100644
+--- a/transformers/llm/engine/src/omni.cpp
++++ b/transformers/llm/engine/src/omni.cpp
+@@ -11,6 +11,8 @@
+ #endif
+ #include <regex>
+ #include <algorithm>
++#include <cmath>
++#include <cstdint>
+ #include <random>
+ #include <MNN/AutoTime.hpp>
+ #include <MNN/expr/ExecutorScope.hpp>
+@@ -33,8 +35,204 @@ namespace MNN {
+ using namespace Express;
+ namespace Transformer {
+ 
++static int roundHalfToEven(float value) {
++    float floorValue = std::floor(value);
++    float diff = value - floorValue;
++    int rounded = static_cast<int>(floorValue);
++    constexpr float eps = 1e-6f;
++    if (diff > 0.5f + eps) {
++        return rounded + 1;
++    }
++    if (diff < 0.5f - eps) {
++        return rounded;
++    }
++    return (rounded % 2 == 0) ? rounded : rounded + 1;
++}
++
++static std::pair<int, int> qwenVlSmartResize(int height, int width, int factor, int minPixels, int maxPixels) {
++    int resizedHeight = roundHalfToEven(static_cast<float>(height) / factor) * factor;
++    int resizedWidth = roundHalfToEven(static_cast<float>(width) / factor) * factor;
++    int64_t resizedPixels = static_cast<int64_t>(resizedHeight) * resizedWidth;
++    if (resizedPixels > maxPixels) {
++        float beta = std::sqrt(static_cast<float>(height) * width / maxPixels);
++        resizedHeight = static_cast<int>(std::floor(height / beta / factor)) * factor;
++        resizedWidth = static_cast<int>(std::floor(width / beta / factor)) * factor;
++    } else if (resizedPixels < minPixels) {
++        float beta = std::sqrt(static_cast<float>(minPixels) / (static_cast<float>(height) * width));
++        resizedHeight = static_cast<int>(std::ceil(height * beta / factor)) * factor;
++        resizedWidth = static_cast<int>(std::ceil(width * beta / factor)) * factor;
++    }
++    return std::make_pair(resizedHeight, resizedWidth);
++}
++
++static constexpr int kPillowResizePrecisionBits = 32 - 8 - 2;
++static constexpr int kPillowResizePrecision = 1 << kPillowResizePrecisionBits;
++
++static inline double pillowBicubicFilter(double x) {
++    if (x < 0.0) {
++        x = -x;
++    }
++    if (x < 1.0) {
++        return ((1.5 * x - 2.5) * x) * x + 1.0;
++    }
++    if (x < 2.0) {
++        return (((-0.5 * x + 2.5) * x - 4.0) * x) + 2.0;
++    }
++    return 0.0;
++}
++
++struct PillowResizeCoeffs {
++    int ksize = 0;
++    std::vector<int> bounds;
++    std::vector<int> weights;
++};
++
++static PillowResizeCoeffs precomputePillowResizeCoeffs(int inSize, int outSize) {
++    const double filterSupport = 2.0;
++    const double scale = static_cast<double>(inSize) / static_cast<double>(outSize);
++    const double filterScale = std::max(scale, 1.0);
++    const double support = filterSupport * filterScale;
++    const int ksize = static_cast<int>(std::ceil(support)) * 2 + 1;
++
++    PillowResizeCoeffs coeffs;
++    coeffs.ksize = ksize;
++    coeffs.bounds.resize(outSize * 2);
++    coeffs.weights.assign(outSize * ksize, 0);
++
++    std::vector<double> floatWeights(ksize);
++    for (int xx = 0; xx < outSize; ++xx) {
++        const double center = (xx + 0.5) * scale;
++        int xmin = static_cast<int>(center - support + 0.5);
++        xmin = std::max(xmin, 0);
++        int xmax = static_cast<int>(center + support + 0.5);
++        xmax = std::min(xmax, inSize);
++        xmax -= xmin;
++
++        double weightSum = 0.0;
++        for (int x = 0; x < xmax; ++x) {
++            const double arg = (x + xmin - center + 0.5) / filterScale;
++            floatWeights[x] = pillowBicubicFilter(arg);
++            weightSum += floatWeights[x];
++        }
++        if (weightSum != 0.0) {
++            for (int x = 0; x < xmax; ++x) {
++                floatWeights[x] /= weightSum;
++            }
++        }
++        for (int x = 0; x < xmax; ++x) {
++            coeffs.weights[xx * ksize + x] = static_cast<int>(floatWeights[x] * kPillowResizePrecision);
++        }
++        for (int x = xmax; x < ksize; ++x) {
++            coeffs.weights[xx * ksize + x] = 0;
++        }
++        coeffs.bounds[xx * 2] = xmin;
++        coeffs.bounds[xx * 2 + 1] = xmax;
++    }
++    return coeffs;
++}
++
++static inline uint8_t pillowClipU8(int v) {
++    if (v < 0) {
++        return 0;
++    }
++    if (v > 255) {
++        return 255;
++    }
++    return static_cast<uint8_t>(v);
++}
++
++static void pillowHorizontalResizePass(const uint8_t* src, int inW, int inH, int channels, uint8_t* dst, int outW,
++                                       const PillowResizeCoeffs& xCoeffs) {
++    const int rounding = 1 << (kPillowResizePrecisionBits - 1);
++    for (int y = 0; y < inH; ++y) {
++        for (int x = 0; x < outW; ++x) {
++            const int xmin = xCoeffs.bounds[x * 2];
++            const int xmax = xCoeffs.bounds[x * 2 + 1];
++            const int* weights = xCoeffs.weights.data() + x * xCoeffs.ksize;
++            for (int c = 0; c < channels; ++c) {
++                int sum = 0;
++                for (int k = 0; k < xmax; ++k) {
++                    sum += src[(y * inW + xmin + k) * channels + c] * weights[k];
++                }
++                dst[(y * outW + x) * channels + c] = pillowClipU8((sum + rounding) >> kPillowResizePrecisionBits);
++            }
++        }
++    }
++}
++
++static void pillowVerticalResizePass(const uint8_t* src, int inW, int inH, int channels, uint8_t* dst, int outH,
++                                     const PillowResizeCoeffs& yCoeffs) {
++    const int rounding = 1 << (kPillowResizePrecisionBits - 1);
++    for (int y = 0; y < outH; ++y) {
++        const int ymin = yCoeffs.bounds[y * 2];
++        const int ymax = yCoeffs.bounds[y * 2 + 1];
++        const int* weights = yCoeffs.weights.data() + y * yCoeffs.ksize;
++        for (int x = 0; x < inW; ++x) {
++            for (int c = 0; c < channels; ++c) {
++                int sum = 0;
++                for (int k = 0; k < ymax; ++k) {
++                    sum += src[((ymin + k) * inW + x) * channels + c] * weights[k];
++                }
++                dst[(y * inW + x) * channels + c] = pillowClipU8((sum + rounding) >> kPillowResizePrecisionBits);
++            }
++        }
++    }
++}
++
++static std::vector<uint8_t> pillowLikeBicubicResizeRgb(const uint8_t* bgr, int inW, int inH, int outW, int outH) {
++    constexpr int channels = 3;
++    std::vector<uint8_t> rgb(static_cast<size_t>(inW) * inH * channels);
++    for (int y = 0; y < inH; ++y) {
++        for (int x = 0; x < inW; ++x) {
++            const uint8_t* src = bgr + (y * inW + x) * channels;
++            uint8_t* dst = rgb.data() + (y * inW + x) * channels;
++            dst[0] = src[2];
++            dst[1] = src[1];
++            dst[2] = src[0];
++        }
++    }
++
++    auto xCoeffs = precomputePillowResizeCoeffs(inW, outW);
++    auto yCoeffs = precomputePillowResizeCoeffs(inH, outH);
++    std::vector<uint8_t> tmp(static_cast<size_t>(outW) * inH * channels);
++    std::vector<uint8_t> resized(static_cast<size_t>(outW) * outH * channels);
++    pillowHorizontalResizePass(rgb.data(), inW, inH, channels, tmp.data(), outW, xCoeffs);
++    pillowVerticalResizePass(tmp.data(), outW, inH, channels, resized.data(), outH, yCoeffs);
++    return resized;
++}
++
++static VARP qwen3VlPillowResizeAndNormalize(VARP image, int outW, int outH) {
++    if (image.get() == nullptr || image->getInfo() == nullptr) {
++        return nullptr;
++    }
++    auto info = image->getInfo();
++    if (info->dim.size() != 3 || info->dim[2] != 3) {
++        MNN_ERROR("qwen3VlPillowResizeAndNormalize expects HWC 3-channel image\n");
++        return nullptr;
++    }
++    const int inH = info->dim[0];
++    const int inW = info->dim[1];
++    auto bgr = image->readMap<uint8_t>();
++    if (bgr == nullptr) {
++        MNN_ERROR("qwen3VlPillowResizeAndNormalize failed to map input image\n");
++        return nullptr;
++    }
++
++    auto resized = pillowLikeBicubicResizeRgb(bgr, inW, inH, outW, outH);
++    auto output = Express::_Input({outH, outW, 3}, NHWC, halide_type_of<float>());
++    auto outPtr = output->writeMap<float>();
++    if (outPtr == nullptr) {
++        MNN_ERROR("qwen3VlPillowResizeAndNormalize failed to map output\n");
++        return nullptr;
++    }
++    for (size_t i = 0; i < resized.size(); ++i) {
++        outPtr[i] = (static_cast<float>(resized[i]) / 255.0f - 0.5f) / 0.5f;
++    }
++    return output;
++}
++
+ template <typename T>
+-static inline VARP _var(std::vector<T> vec, const std::vector<int> &dims) {
++static inline VARP _var(std::vector<T> vec, const std::vector<int>& dims) {
+     return _Const(vec.data(), dims, NHWC, halide_type_of<T>());
+ }
+ 
+@@ -79,12 +277,12 @@ static MNNForwardType backend_type_convert(const std::string& type_str) {
+ Omni::Omni(std::shared_ptr<LlmConfig> config) : Llm(config) {
+     if (config->is_visual()) {
+         mVisionHeight = config->config_.value("image_size", mVisionHeight);
+-        mVisionWidth  = mVisionHeight;
+-        mVisionPad    = config->config_.value("image_pad", mVisionPad);
+-        mVisionStart  = config->config_.value("vision_start", mVisionStart);
+-        mVisionEnd    = config->config_.value("vision_end", mVisionEnd);
+-        mVisionMean   = config->config_.value("image_mean", mVisionMean);
+-        mVisionNorm   = config->config_.value("image_norm", mVisionNorm);
++        mVisionWidth = mVisionHeight;
++        mVisionPad = config->config_.value("image_pad", mVisionPad);
++        mVisionStart = config->config_.value("vision_start", mVisionStart);
++        mVisionEnd = config->config_.value("vision_end", mVisionEnd);
++        mVisionMean = config->config_.value("image_mean", mVisionMean);
++        mVisionNorm = config->config_.value("image_norm", mVisionNorm);
+         mVisionSizeUnit = config->config_.value("image_size_unit", mVisionSizeUnit);
+         mVisionMaxSize = config->config_.value("image_max_size", mVisionMaxSize);
+         mVisionGlobal = config->config_.value("global_image", mVisionGlobal);
+@@ -107,9 +305,9 @@ bool Omni::load() {
+         mProcessorRuntimeManager = mRuntimeManager;
+     } else {
+         BackendConfig cpuBackendConfig;
+-        config.type      = backend_type_convert(mConfig->backend_type(true));
++        config.type = backend_type_convert(mConfig->backend_type(true));
+         config.numThread = mConfig->thread_num(true);
+-        if(config.type == 3){
++        if (config.type == 3) {
+             config.numThread |= 64;
+         }
+         if (mConfig->power(true) == "high") {
+@@ -143,28 +341,30 @@ bool Omni::load() {
+         mExtraArgs.emplace_back(Express::_Fill(_var<int>({3, 1, 1}, {3}), _Scalar<float>(0.0)));
+     }
+     Module::Config module_config;
+-    if(config.type == MNN_FORWARD_NN) {
++    if (config.type == MNN_FORWARD_NN) {
+         module_config.shapeMutable = false;
+-        module_config.rearrange    = false;
++        module_config.rearrange = false;
+     } else {
+         module_config.shapeMutable = true;
+-        module_config.rearrange    = true;
++        module_config.rearrange = true;
+     }
+     // pMeta isolation between LLM and processor RTMs is now provided by
+     // per-RTM RuntimeAttr::mPMeta + applyMetaToRuntime; no manual reset needed.
+     if (mConfig->is_visual()) {
+-        mVisionModule.reset(Module::load({}, {}, mConfig->visual_model().c_str(), mProcessorRuntimeManager, &module_config));
++        mVisionModule.reset(
++            Module::load({}, {}, mConfig->visual_model().c_str(), mProcessorRuntimeManager, &module_config));
+         if (nullptr == mVisionModule.get()) {
+             return false;
+         }
+     }
+     if (mConfig->is_audio()) {
+-        mAudioModule.reset(Module::load({}, {}, mConfig->audio_model().c_str(), mProcessorRuntimeManager, &module_config));
++        mAudioModule.reset(
++            Module::load({}, {}, mConfig->audio_model().c_str(), mProcessorRuntimeManager, &module_config));
+         if (nullptr == mAudioModule.get()) {
+             return false;
+         }
+     }
+-    mContext->status = LlmStatus::RUNNING;  // Set status to RUNNING after successful load
++    mContext->status = LlmStatus::RUNNING; // Set status to RUNNING after successful load
+     return true;
+ }
+ 
+@@ -172,9 +372,8 @@ bool Omni::load() {
+ std::vector<int> Omni::defaultVisionProcess(VARP image) {
+     MNN::Express::ExecutorScope s(mExecutor);
+     mVisionHeight = UP_DIV(mVisionHeight, mVisionSizeUnit) * mVisionSizeUnit;
+-    mVisionWidth  = UP_DIV(mVisionWidth, mVisionSizeUnit) * mVisionSizeUnit;
+-    image = MNN::CV::resize(image, {mVisionWidth, mVisionHeight}, 0, 0,
+-                            MNN::CV::INTER_LINEAR, MNN::CV::COLOR_BGR2RGB,
++    mVisionWidth = UP_DIV(mVisionWidth, mVisionSizeUnit) * mVisionSizeUnit;
++    image = MNN::CV::resize(image, {mVisionWidth, mVisionHeight}, 0, 0, MNN::CV::INTER_LINEAR, MNN::CV::COLOR_BGR2RGB,
+                             mVisionMean, mVisionNorm);
+     image = Express::_Unsqueeze(image, {0});
+     image = Express::_Convert(image, NC4HW4);
+@@ -196,14 +395,16 @@ std::vector<int> Omni::gemma4VisionProcess(VARP image) {
+     const int pooling_kernel_size = 3;
+     int max_soft_tokens = 280;
+     int max_patches = max_soft_tokens * pooling_kernel_size * pooling_kernel_size; // 2520
+-    int patch_pixels = 3 * patch_size * patch_size; // 768
++    int patch_pixels = 3 * patch_size * patch_size;                                // 768
+ 
+     // 1. Resize preserving aspect ratio, aligned to patch_size * pooling_kernel_size
+     int align_size = patch_size * pooling_kernel_size; // 48
+     mVisionHeight = round(mVisionHeight / (float)align_size) * align_size;
+-    mVisionWidth  = round(mVisionWidth / (float)align_size) * align_size;
+-    if (mVisionHeight < align_size) mVisionHeight = align_size;
+-    if (mVisionWidth < align_size) mVisionWidth = align_size;
++    mVisionWidth = round(mVisionWidth / (float)align_size) * align_size;
++    if (mVisionHeight < align_size)
++        mVisionHeight = align_size;
++    if (mVisionWidth < align_size)
++        mVisionWidth = align_size;
+     // Ensure total patches <= max_patches
+     int total_patches = (mVisionHeight / patch_size) * (mVisionWidth / patch_size);
+     while (total_patches > max_patches) {
+@@ -217,9 +418,8 @@ std::vector<int> Omni::gemma4VisionProcess(VARP image) {
+ 
+     // 2. Resize and rescale to [0, 1]
+     std::vector<float> mean = {0.0f, 0.0f, 0.0f};
+-    std::vector<float> norm = {1.0f/255.0f, 1.0f/255.0f, 1.0f/255.0f};
+-    image = MNN::CV::resize(image, {mVisionWidth, mVisionHeight}, 0, 0,
+-                            MNN::CV::INTER_LINEAR, MNN::CV::COLOR_BGR2RGB,
++    std::vector<float> norm = {1.0f / 255.0f, 1.0f / 255.0f, 1.0f / 255.0f};
++    image = MNN::CV::resize(image, {mVisionWidth, mVisionHeight}, 0, 0, MNN::CV::INTER_LINEAR, MNN::CV::COLOR_BGR2RGB,
+                             mean, norm);
+     // 3. Patchify: CV::resize outputs [H, W, 3] but readMap returns NC4HW4 packed data (stride=4)
+     int grid_h = mVisionHeight / patch_size;
+@@ -257,8 +457,8 @@ std::vector<int> Omni::gemma4VisionProcess(VARP image) {
+     for (int h = 0; h < grid_h; h++) {
+         for (int w = 0; w < grid_w; w++) {
+             int idx = h * grid_w + w;
+-            posPtr[idx * 2 + 0] = w;  // x
+-            posPtr[idx * 2 + 1] = h;  // y
++            posPtr[idx * 2 + 0] = w; // x
++            posPtr[idx * 2 + 1] = h; // y
+         }
+     }
+ 
+@@ -271,7 +471,8 @@ std::vector<int> Omni::gemma4VisionProcess(VARP image) {
+ 
+         auto pad_pos = Express::_Input({pad_len, 2}, NCHW, halide_type_of<int>());
+         auto padPosPtr = pad_pos->writeMap<int>();
+-        for (int i = 0; i < pad_len * 2; i++) padPosPtr[i] = -1;
++        for (int i = 0; i < pad_len * 2; i++)
++            padPosPtr[i] = -1;
+         posIds = Express::_Concat({posIds, pad_pos}, 0);
+     }
+ 
+@@ -321,35 +522,54 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
+     constexpr int merge_size = 2;
+     const int align_size = patch_size * merge_size;
+     // Qwen2-VL / Qwen2.5-VL / Qwen3-VL
+-    mVisionHeight = round(mVisionHeight / (float)align_size) * align_size;
+-    mVisionWidth = round(mVisionWidth / (float)align_size) * align_size;
+-    image = MNN::CV::resize(image, {mVisionWidth, mVisionHeight}, 0, 0,
+-                            MNN::CV::INTER_LINEAR, MNN::CV::COLOR_BGR2RGB,
+-                            mVisionMean, mVisionNorm);
++    const int defaultMinPixels = isQwen3VL ? 65536 : 3136;
++    const int defaultMaxPixels = isQwen3VL ? 16777216 : 12845056;
++    const int minPixels = mConfig->config_.value("image_min_pixels", defaultMinPixels);
++    const int maxPixels = mConfig->config_.value("image_max_pixels", defaultMaxPixels);
++    auto resizedSize = qwenVlSmartResize(mVisionHeight, mVisionWidth, align_size, minPixels, maxPixels);
++    mVisionHeight = resizedSize.first;
++    mVisionWidth = resizedSize.second;
++    bool usePillowResize = isQwen3VL && mConfig->config_.value("qwen3_vl_pillow_resize", true);
++    if (usePillowResize) {
++        auto pillowImage = qwen3VlPillowResizeAndNormalize(image, mVisionWidth, mVisionHeight);
++        if (pillowImage.get() != nullptr) {
++            image = pillowImage;
++        } else {
++            MNN_ERROR("qwen3VlPillowResizeAndNormalize failed, fallback to MNN CV resize\n");
++            image = MNN::CV::resize(image, {mVisionWidth, mVisionHeight}, 0, 0, MNN::CV::INTER_LINEAR,
++                                    MNN::CV::COLOR_BGR2RGB, mVisionMean, mVisionNorm);
++        }
++    } else {
++        image = MNN::CV::resize(image, {mVisionWidth, mVisionHeight}, 0, 0, MNN::CV::INTER_LINEAR,
++                                MNN::CV::COLOR_BGR2RGB, mVisionMean, mVisionNorm);
++    }
+     image = Express::_Unsqueeze(image, {0});
+     image = Express::_Convert(image, NCHW);
+     auto patches = Express::_Concat({image, image}, 0);
+     auto patches_dim = patches->getInfo()->dim;
+     int temporal = patches_dim[0];
+-    int channel  = patches_dim[1];
+-    int height   = patches_dim[2];
+-    int width    = patches_dim[3];
++    int channel = patches_dim[1];
++    int height = patches_dim[2];
++    int width = patches_dim[3];
+     int grid_t = temporal / temporal_patch_size;
+     int grid_h = height / patch_size;
+     int grid_w = width / patch_size;
+     addPositionIds(grid_t, grid_h / merge_size, grid_w / merge_size);
+     // build patches
+     patches = Express::_Reshape(patches, {
+-        grid_t, temporal_patch_size,
+-        channel,
+-        grid_h / merge_size, merge_size, patch_size,
+-        grid_w / merge_size, merge_size, patch_size,
+-    });
++                                             grid_t,
++                                             temporal_patch_size,
++                                             channel,
++                                             grid_h / merge_size,
++                                             merge_size,
++                                             patch_size,
++                                             grid_w / merge_size,
++                                             merge_size,
++                                             patch_size,
++                                         });
+     patches = Express::_Permute(patches, {0, 3, 6, 4, 7, 2, 1, 5, 8});
+-    patches = Express::_Reshape(patches, {
+-        grid_t * grid_h * grid_w,
+-        channel * temporal_patch_size * patch_size * patch_size
+-    });
++    patches =
++        Express::_Reshape(patches, {grid_t * grid_h * grid_w, channel * temporal_patch_size * patch_size * patch_size});
+     const int seq_len = grid_t * grid_h * grid_w;
+     // build position_ids
+     const int wblock_size = merge_size * merge_size;
+@@ -367,7 +587,7 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
+         }
+     }
+     VARP attention_mask, window_index;
+-    VARPS moduleInputs= {patches, position_ids};
++    VARPS moduleInputs = {patches, position_ids};
+     if (hasWindowIndex) {
+         // Qwen2.5-VL: build window_index
+         window_index = Express::_Input({seq_len / 4}, NCHW, halide_type_of<int>());
+@@ -390,10 +610,12 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
+                     int count = 0;
+                     for (int i = 0; i < vit_merger_window_size; ++i) {
+                         int h_global = win_h * vit_merger_window_size + i;
+-                        if (h_global >= llm_grid_h) continue;
++                        if (h_global >= llm_grid_h)
++                            continue;
+                         for (int j = 0; j < vit_merger_window_size; ++j) {
+                             int w_global = win_w * vit_merger_window_size + j;
+-                            if (w_global >= llm_grid_w) continue;
++                            if (w_global >= llm_grid_w)
++                                continue;
+                             int idx = t * llm_grid_h * llm_grid_w + h_global * llm_grid_w + w_global;
+                             window_index_ptr[window_index_idx++] = idx;
+                             ++count;
+@@ -467,10 +689,12 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
+                 weight_ptr[3 * num_patches + idx] = dh * dw;
+             }
+         }
+-        idx_tensor = Express::_Reshape(idx_tensor, {4, grid_t, grid_h / merge_size, merge_size, grid_w / merge_size, merge_size});
++        idx_tensor = Express::_Reshape(idx_tensor,
++                                       {4, grid_t, grid_h / merge_size, merge_size, grid_w / merge_size, merge_size});
+         idx_tensor = Express::_Permute(idx_tensor, {0, 1, 2, 4, 3, 5});
+         idx_tensor = Express::_Reshape(idx_tensor, {4, -1});
+-        weight_tensor = Express::_Reshape(weight_tensor, {4, grid_t, grid_h / merge_size, merge_size, grid_w / merge_size, merge_size});
++        weight_tensor = Express::_Reshape(
++            weight_tensor, {4, grid_t, grid_h / merge_size, merge_size, grid_w / merge_size, merge_size});
+         weight_tensor = Express::_Permute(weight_tensor, {0, 1, 2, 4, 3, 5});
+         weight_tensor = Express::_Reshape(weight_tensor, {4, -1});
+         moduleInputs.push_back(idx_tensor);
+@@ -506,9 +730,8 @@ std::vector<int> Omni::smolvlmVisionProcess(VARP image) {
+     MNN::Express::ExecutorScope s(mExecutor);
+     // SmolVLM / LFM2-VL: compute visionLen from global image forward
+     bool splitImage = mVisionHeight > mVisionSizeUnit || mVisionWidth > mVisionSizeUnit;
+-    auto globalImage = MNN::CV::resize(image, {mVisionSizeUnit, mVisionSizeUnit}, 0, 0,
+-                                       MNN::CV::INTER_LINEAR, MNN::CV::COLOR_BGR2RGB,
+-                                       mVisionMean, mVisionNorm);
++    auto globalImage = MNN::CV::resize(image, {mVisionSizeUnit, mVisionSizeUnit}, 0, 0, MNN::CV::INTER_LINEAR,
++                                       MNN::CV::COLOR_BGR2RGB, mVisionMean, mVisionNorm);
+     globalImage = Express::_Unsqueeze(globalImage, {0});
+     globalImage = Express::_Convert(globalImage, NCHW);
+     // Forward global image first to determine visionLen dynamically
+@@ -529,31 +752,27 @@ std::vector<int> Omni::smolvlmVisionProcess(VARP image) {
+         if (mVisionWidth > mVisionMaxSize) {
+             mVisionWidth = mVisionMaxSize;
+         }
+-        auto patches = MNN::CV::resize(image, {mVisionWidth, mVisionHeight}, 0, 0,
+-                                       MNN::CV::INTER_LINEAR, MNN::CV::COLOR_BGR2RGB,
+-                                       mVisionMean, mVisionNorm);
++        auto patches = MNN::CV::resize(image, {mVisionWidth, mVisionHeight}, 0, 0, MNN::CV::INTER_LINEAR,
++                                       MNN::CV::COLOR_BGR2RGB, mVisionMean, mVisionNorm);
+         patches = Express::_Unsqueeze(patches, {0});
+         patches = Express::_Convert(patches, NCHW);
+         auto imageDims = patches->getInfo()->dim;
+-        int batch    = imageDims[0];
+-        int channel  = imageDims[1];
+-        int height   = imageDims[2];
+-        int width    = imageDims[3];
++        int batch = imageDims[0];
++        int channel = imageDims[1];
++        int height = imageDims[2];
++        int width = imageDims[3];
+         int grid_h = height / mVisionSizeUnit;
+         int grid_w = width / mVisionSizeUnit;
+         patches = Express::_Reshape(patches, {
+-            batch,
+-            channel,
+-            grid_h, mVisionSizeUnit,
+-            grid_w, mVisionSizeUnit,
+-        });
++                                                 batch,
++                                                 channel,
++                                                 grid_h,
++                                                 mVisionSizeUnit,
++                                                 grid_w,
++                                                 mVisionSizeUnit,
++                                             });
+         patches = Express::_Permute(patches, {0, 2, 4, 1, 3, 5});
+-        patches = Express::_Reshape(patches, {
+-            batch * grid_h * grid_w,
+-            channel,
+-            mVisionSizeUnit,
+-            mVisionSizeUnit
+-        });
++        patches = Express::_Reshape(patches, {batch * grid_h * grid_w, channel, mVisionSizeUnit, mVisionSizeUnit});
+         auto imageEmbedding = mVisionModule->forward(patches);
+         auto embeddingDims = imageEmbedding->getInfo()->dim;
+         for (int i = 0; i < embeddingDims[0]; i++) {
+@@ -591,12 +810,12 @@ std::vector<int> Omni::smolvlmVisionProcess(VARP image) {
+ 
+ std::vector<std::pair<int, int>> minicpmBestSize(std::pair<int, int> original_size, int patch_size) {
+     constexpr int max_slice_nums = 9, scale_resolution = 448;
+-    auto _get_target_size =
+-        [&](std::pair<int, int> size, bool upscale) -> std::pair<int, int> {
++    auto _get_target_size = [&](std::pair<int, int> size, bool upscale) -> std::pair<int, int> {
+         int h = size.first;
+         int w = size.second;
+         int target_w, target_h;
+-        if (!upscale && (static_cast<long long>(w) * h <= static_cast<long long>(scale_resolution) * scale_resolution)) {
++        if (!upscale &&
++            (static_cast<long long>(w) * h <= static_cast<long long>(scale_resolution) * scale_resolution)) {
+             target_w = w;
+             target_h = h;
+         } else {
+@@ -609,17 +828,21 @@ std::vector<std::pair<int, int>> minicpmBestSize(std::pair<int, int> original_si
+                 target_w = scale_resolution;
+             }
+         }
+-        int final_h = std::max(static_cast<int>(std::round(static_cast<double>(target_h) / patch_size)) * patch_size, patch_size);
+-        int final_w = std::max(static_cast<int>(std::round(static_cast<double>(target_w) / patch_size)) * patch_size, patch_size);
++        int final_h =
++            std::max(static_cast<int>(std::round(static_cast<double>(target_h) / patch_size)) * patch_size, patch_size);
++        int final_w =
++            std::max(static_cast<int>(std::round(static_cast<double>(target_w) / patch_size)) * patch_size, patch_size);
+         return std::make_pair(final_h, final_w);
+     };
+     int original_height = original_size.first;
+     int original_width = original_size.second;
+-    double ratio = (static_cast<double>(original_width) * original_height) / (static_cast<double>(scale_resolution) * scale_resolution);
++    double ratio = (static_cast<double>(original_width) * original_height) /
++                   (static_cast<double>(scale_resolution) * scale_resolution);
+     int multiple = std::min(static_cast<int>(std::ceil(ratio)), max_slice_nums);
+     std::vector<std::pair<int, int>> candidates;
+     std::set<int> nums_to_check;
+-    if (multiple > 1) nums_to_check.insert(multiple - 1);
++    if (multiple > 1)
++        nums_to_check.insert(multiple - 1);
+     nums_to_check.insert(multiple);
+     nums_to_check.insert(multiple + 1);
+     for (std::set<int>::iterator it = nums_to_check.begin(); it != nums_to_check.end(); ++it) {
+@@ -628,29 +851,33 @@ std::vector<std::pair<int, int>> minicpmBestSize(std::pair<int, int> original_si
+             for (int m = 1; m * m <= num; ++m) {
+                 if (num % m == 0) {
+                     candidates.push_back(std::make_pair(m, num / m));
+-                    if (m * m != num) candidates.push_back(std::make_pair(num / m, m));
++                    if (m * m != num)
++                        candidates.push_back(std::make_pair(num / m, m));
+                 }
+             }
+         }
+     }
+-    if (candidates.empty()) { candidates.push_back(std::make_pair(1, 1)); }
++    if (candidates.empty()) {
++        candidates.push_back(std::make_pair(1, 1));
++    }
+     double log_ratio = std::log(static_cast<double>(original_width) / original_height);
+-    std::pair<int, int> best_grid = *std::min_element(candidates.begin(), candidates.end(),
+-        [log_ratio](const std::pair<int, int>& g1, const std::pair<int, int>& g2) {
+-            auto key = [log_ratio](const std::pair<int, int>& g) -> double {
+-                if (g.first == 0) return std::numeric_limits<double>::max();
+-                return std::abs(log_ratio - std::log(static_cast<double>(g.second) / g.first));
+-            };
+-            return key(g1) < key(g2);
+-        });
++    std::pair<int, int> best_grid =
++        *std::min_element(candidates.begin(), candidates.end(),
++                          [log_ratio](const std::pair<int, int>& g1, const std::pair<int, int>& g2) {
++                              auto key = [log_ratio](const std::pair<int, int>& g) -> double {
++                                  if (g.first == 0)
++                                      return std::numeric_limits<double>::max();
++                                  return std::abs(log_ratio - std::log(static_cast<double>(g.second) / g.first));
++                              };
++                              return key(g1) < key(g2);
++                          });
+     std::pair<int, int> source_image_size = _get_target_size(original_size, false);
+     double patch_h = static_cast<double>(original_height) / best_grid.first;
+     double patch_w = static_cast<double>(original_width) / best_grid.second;
+-    std::pair<int, int> best_patch_size = _get_target_size(std::make_pair(static_cast<int>(patch_h), static_cast<int>(patch_w)), true);
+-    std::pair<int, int> refine_image_size = std::make_pair(
+-        best_patch_size.first * best_grid.first,
+-        best_patch_size.second * best_grid.second
+-    );
++    std::pair<int, int> best_patch_size =
++        _get_target_size(std::make_pair(static_cast<int>(patch_h), static_cast<int>(patch_w)), true);
++    std::pair<int, int> refine_image_size =
++        std::make_pair(best_patch_size.first * best_grid.first, best_patch_size.second * best_grid.second);
+     std::vector<std::pair<int, int>> result;
+     result.push_back(source_image_size);
+     result.push_back(refine_image_size);
+@@ -666,40 +893,27 @@ std::vector<int> Omni::minicpmVisionProcess(VARP image) {
+     auto globalSize = bestSize[0];
+     auto refineSize = bestSize[1];
+     auto sliceGrids = bestSize[2];
+-    auto reoderImage = [this, &patchSize](
+-        Express::VARP img, std::pair<int, int> targetSize, std::pair<int,int> grid, std::vector<int>& tgtSize) {
+-        auto patches = MNN::CV::resize(img, {targetSize.second, targetSize.first}, 0, 0,
+-                                    MNN::CV::INTER_LINEAR, MNN::CV::COLOR_BGR2RGB,
+-                                    mVisionMean, mVisionNorm);
++    auto reoderImage = [this, &patchSize](Express::VARP img, std::pair<int, int> targetSize, std::pair<int, int> grid,
++                                          std::vector<int>& tgtSize) {
++        auto patches = MNN::CV::resize(img, {targetSize.second, targetSize.first}, 0, 0, MNN::CV::INTER_LINEAR,
++                                       MNN::CV::COLOR_BGR2RGB, mVisionMean, mVisionNorm);
+         patches = Express::_Unsqueeze(patches, {0});
+         patches = Express::_Convert(patches, NCHW);
+         auto imageDims = patches->getInfo()->dim;
+-        int batch   = imageDims[0];
++        int batch = imageDims[0];
+         int channel = imageDims[1];
+-        int height  = imageDims[2];
+-        int width   = imageDims[3];
+-        int gridH   = grid.first;
+-        int gridW   = grid.second;
++        int height = imageDims[2];
++        int width = imageDims[3];
++        int gridH = grid.first;
++        int gridW = grid.second;
+         int subHeight = height / gridH;
+         int subWidth = width / gridW;
+         int numPatchesH = subHeight / patchSize;
+         int numPatchesW = subWidth / patchSize;
+-        patches = Express::_Reshape(patches, {
+-            channel,
+-            gridH,
+-            numPatchesH,
+-            patchSize,
+-            gridW,
+-            numPatchesW,
+-            patchSize
+-        });
++        patches = Express::_Reshape(patches, {channel, gridH, numPatchesH, patchSize, gridW, numPatchesW, patchSize});
+         patches = Express::_Permute(patches, {1, 4, 0, 3, 2, 5, 6});
+-        patches = Express::_Reshape(patches, {
+-            gridH * gridW,
+-            channel,
+-            patchSize,
+-            numPatchesH * numPatchesW * patchSize
+-        });
++        patches =
++            Express::_Reshape(patches, {gridH * gridW, channel, patchSize, numPatchesH * numPatchesW * patchSize});
+         for (int i = 0; i < gridH * gridW; i++) {
+             tgtSize.push_back(numPatchesH);
+             tgtSize.push_back(numPatchesW);
+@@ -725,13 +939,10 @@ std::vector<int> Omni::minicpmVisionProcess(VARP image) {
+         int nb_patches_h = tgtSize[i * 2];
+         int nb_patches_w = tgtSize[i * 2 + 1];
+         for (int h_idx = 0; h_idx < nb_patches_h; ++h_idx) {
+-            long bucket_h = static_cast<long>(std::floor(
+-                (static_cast<float>(h_idx) / nb_patches_h) * patchesPerSide
+-            ));
++            long bucket_h = static_cast<long>(std::floor((static_cast<float>(h_idx) / nb_patches_h) * patchesPerSide));
+             for (int w_idx = 0; w_idx < nb_patches_w; ++w_idx) {
+-                long bucket_w = static_cast<long>(std::floor(
+-                    (static_cast<float>(w_idx) / nb_patches_w) * patchesPerSide
+-                ));
++                long bucket_w =
++                    static_cast<long>(std::floor((static_cast<float>(w_idx) / nb_patches_w) * patchesPerSide));
+                 long pos_id = bucket_h * patchesPerSide + bucket_w;
+                 long patch_idx = h_idx * nb_patches_w + w_idx;
+                 posPtr[i * L + patch_idx] = static_cast<int>(pos_id);
+@@ -834,8 +1045,8 @@ std::vector<int> Omni::audioProcess(const std::string& file) {
+ #ifdef LLM_SUPPORT_AUDIO
+     MNN::Express::ExecutorScope s(mExecutor);
+     constexpr int sample_rate = 16000;
+-    auto load_res        = MNN::AUDIO::load(file, sample_rate);
+-    VARP waveform        = load_res.first;
++    auto load_res = MNN::AUDIO::load(file, sample_rate);
++    VARP waveform = load_res.first;
+     if (waveform == nullptr) {
+         MNN_PRINT("Omni Can't open audio: %s\n", file.c_str());
+         return std::vector<int>(0);
+@@ -977,7 +1188,7 @@ std::vector<int> Omni::multimodeProcess(const std::string& mode, std::string inf
+         }
+         // std::cout << host << "#" << path << std::endl;
+         httplib::Client cli(host);
+-        auto res  = cli.Get(path);
++        auto res = cli.Get(path);
+         file_info = "downloaded_file";
+         if (res && res->status == 200) {
+             std::ofstream file(file_info, std::ios::binary);
+@@ -1065,21 +1276,24 @@ std::vector<int> Omni::tokenizer_encode(const std::string& prompt) {
+     return tokenizer_encode(multimodal_input);
+ }
+ 
+-std::vector<int> Omni::processImageContent(const std::string& content, const std::map<std::string, PromptImagePart>& images) {
++std::vector<int> Omni::processImageContent(const std::string& content,
++                                           const std::map<std::string, PromptImagePart>& images) {
+     auto it = images.find(content);
+     if (it != images.end()) {
+         if (it->second.height > 0 && it->second.width > 0) {
+             mVisionHeight = it->second.height;
+             mVisionWidth = it->second.width;
+         }
+-        // MNN_PRINT("processImageContent: using placeholder '%s' with size %dx%d", content.c_str(), mVisionWidth, mVisionHeight);
++        // MNN_PRINT("processImageContent: using placeholder '%s' with size %dx%d", content.c_str(), mVisionWidth,
++        // mVisionHeight);
+         return visionProcess(it->second.image_data);
+     }
+     // MNN_PRINT("processImageContent: treating '%s' as file path or URL", content.c_str());
+     return multimodeProcess("img", content);
+ }
+ 
+-std::vector<int> Omni::processAudioContent(const std::string& content, const std::map<std::string, PromptAudioPart>& audios) {
++std::vector<int> Omni::processAudioContent(const std::string& content,
++                                           const std::map<std::string, PromptAudioPart>& audios) {
+     auto it = audios.find(content);
+     if (it != audios.end()) {
+         // MNN_PRINT("processAudioContent: using placeholder '%s'", content.c_str());
+@@ -1137,7 +1351,8 @@ VARP Omni::embedding(const std::vector<int>& input_ids) {
+     auto deepstacksTxt = [&]() {
+         if (hasDeepStack) {
+             deepstackShape[1] = cur_txt_ids.size();
+-            deepstacks.push_back(Express::_Fill(_var<int>(deepstackShape, {static_cast<int>(deepstackShape.size())}), _Scalar<float>(0.0)));
++            deepstacks.push_back(Express::_Fill(_var<int>(deepstackShape, {static_cast<int>(deepstackShape.size())}),
++                                                _Scalar<float>(0.0)));
+         }
+     };
+     for (int i = 0; i < input_ids.size(); i++) {
+@@ -1152,7 +1367,7 @@ VARP Omni::embedding(const std::vector<int>& input_ids) {
+             }
+         } else if (id == mAudioPad) {
+             auto txt_embedding = Llm::embedding(cur_txt_ids);
+-            if(txt_embedding == nullptr) {
++            if (txt_embedding == nullptr) {
+                 return nullptr;
+             }
+             auto mul_embedding = mAudioEmbeddings[audio_idx++];
+@@ -1170,7 +1385,7 @@ VARP Omni::embedding(const std::vector<int>& input_ids) {
+             }
+         } else if (id == mVisionPad) {
+             auto txt_embedding = Llm::embedding(cur_txt_ids);
+-            if(txt_embedding == nullptr) {
++            if (txt_embedding == nullptr) {
+                 return nullptr;
+             }
+             if (hasDeepStack) {
+@@ -1187,7 +1402,7 @@ VARP Omni::embedding(const std::vector<int>& input_ids) {
+     }
+     if (!cur_txt_ids.empty()) {
+         auto txt_embedding = Llm::embedding(cur_txt_ids);
+-        if(txt_embedding == nullptr) {
++        if (txt_embedding == nullptr) {
+             return nullptr;
+         }
+         embeddings.push_back(txt_embedding);
+@@ -1234,9 +1449,8 @@ VARP Omni::gen_position_ids(int seq_len) {
+     }
+     auto ptr = positionIds->writeMap<int>();
+     if (mContext->gen_seq_len > 0) {
+-        for (int i=0; i<seq_len; ++i) {
+-            // auto pos = mContext->gen_seq_len + mPositionIds.back() + i;
+-            auto pos = mContext->all_seq_len + i;
++        for (int i = 0; i < seq_len; ++i) {
++            auto pos = mContext->gen_seq_len + mPositionIds.back() + i;
+             ptr[i + 0] = pos;
+             ptr[i + seq_len] = pos;
+             ptr[i + seq_len * 2] = pos;
+@@ -1263,7 +1477,8 @@ VARP Omni::gen_position_ids(int seq_len) {
+     return positionIds;
+ }
+ 
+-std::vector<Express::VARP> Omni::forwardRaw(Express::VARP hiddenState, Express::VARP mask, Express::VARP inputPos, Express::VARPS extraArgs) {
++std::vector<Express::VARP> Omni::forwardRaw(Express::VARP hiddenState, Express::VARP mask, Express::VARP inputPos,
++                                            Express::VARPS extraArgs) {
+     MNN::Express::ExecutorScope s(mExecutor);
+     extraArgs.insert(extraArgs.end(), mExtraArgs.begin(), mExtraArgs.end());
+     auto outputs = Llm::forwardRaw(hiddenState, mask, inputPos, extraArgs);
+@@ -1457,7 +1672,9 @@ void Omni::responseInterleaved(const std::vector<int>& input_ids, std::ostream*
+ 
+ void Omni::response(const std::vector<int>& input_ids, std::ostream* os, const char* end_with, int max_new_tokens) {
+     MNN::Express::ExecutorScope s(mExecutor);
+-    if (!end_with) { end_with = "\n"; }
++    if (!end_with) {
++        end_with = "\n";
++    }
+     generate_init(os, end_with);
+     if (mTalker) {
+         mTalker->generate_init();
+@@ -1536,23 +1753,23 @@ bool Talker::load() {
+ 
+     Module::Config module_config;
+     module_config.shapeMutable = false;
+-    module_config.rearrange    = true;
+-    std::vector<std::string> inputNames {"inputs_embeds", "attention_mask", "position_ids", "logits_index"};
++    module_config.rearrange = true;
++    std::vector<std::string> inputNames{"inputs_embeds", "attention_mask", "position_ids", "logits_index"};
+ 
+-    mModule.reset(Module::load(inputNames,
+-                                    {"logits"}, mConfig->talker_model().c_str(), mRuntimeManager, &module_config));
++    mModule.reset(
++        Module::load(inputNames, {"logits"}, mConfig->talker_model().c_str(), mRuntimeManager, &module_config));
+     if (mModule.get() == nullptr) {
+         return false;
+     }
+     auto module_runtime = mProcessorRuntimeManager ? mProcessorRuntimeManager : mRuntimeManager;
+     // dit
+     mPreDit.reset(Module::load({"cond", "spk", "code"}, {"code_embeds", "rope", "mask"},
+-                                mConfig->predit_model().c_str(), module_runtime, &module_config));
+-    mDit.reset(Module::load({"x", "code_embeds", "rope", "mask", "time"}, {"mel"},
+-                            mConfig->dit_model().c_str(), module_runtime, &module_config));
++                               mConfig->predit_model().c_str(), module_runtime, &module_config));
++    mDit.reset(Module::load({"x", "code_embeds", "rope", "mask", "time"}, {"mel"}, mConfig->dit_model().c_str(),
++                            module_runtime, &module_config));
+     // bigvgan
+-    mBigvgan.reset(Module::load({"generated_mel"},
+-                                {"waveform"}, mConfig->bigvgan_model().c_str(), module_runtime, &module_config));
++    mBigvgan.reset(Module::load({"generated_mel"}, {"waveform"}, mConfig->bigvgan_model().c_str(), module_runtime,
++                                &module_config));
+     // autoregressive decode module
+     mModulePool[std::make_pair(1, false)].reset(Module::clone(mModule.get()));
+     // prefill module
+@@ -1561,12 +1778,12 @@ bool Talker::load() {
+         return false;
+     }
+     mAsyncToken2Wav = (module_runtime.get() != mRuntimeManager.get());
+-    
++
+     if (mAsyncToken2Wav && doGenerate()) {
+         startAsyncWorker();
+     }
+-    
+-    mContext->status = LlmStatus::RUNNING;  // Set status to RUNNING after successful load
++
++    mContext->status = LlmStatus::RUNNING; // Set status to RUNNING after successful load
+     return true;
+ }
+ 
+@@ -1577,7 +1794,9 @@ Talker::~Talker() {
+ }
+ 
+ void Talker::generate_init(std::ostream* os, const char* end_with) {
+-    if (!doGenerate()) { return; }
++    if (!doGenerate()) {
++        return;
++    }
+     Llm::generate_init(os, end_with);
+     // stream generate init
+     mTalkerEmbeds.clear();
+@@ -1718,7 +1937,8 @@ void Talker::token2wav(bool talker_done) {
+     MNN::Timer _t;
+     // dit
+     auto generated_mel = ditForward(real_size, codec_ptr, noise_ptr);
+-    generated_mel = _Slice(generated_mel, _var<int>({0, 0, dit_left_padding * 2}, {3}), _var<int>({-1, -1, mel_size}, {3}));
++    generated_mel =
++        _Slice(generated_mel, _var<int>({0, 0, dit_left_padding * 2}, {3}), _var<int>({-1, -1, mel_size}, {3}));
+     mMelBuffer = (mMelBuffer == nullptr) ? generated_mel : _Concat({mMelBuffer, generated_mel}, -1);
+     dit_left_padding = dit_left_context;
+     dit_start_index += (chunk_size - dit_left_padding - dit_right_padding);
+@@ -1729,11 +1949,14 @@ void Talker::token2wav(bool talker_done) {
+     auto size = generated_waveform->getInfo()->size - (vocoder_left_pad + vocoder_right_pad) * vocoder_upsample_rate;
+     mWaveformBuffer.insert(mWaveformBuffer.end(), ptr, ptr + size);
+     vocoder_left_pad = vocoder_left_context;
+-    mMelBuffer = _Slice(mMelBuffer, _var<int>({0, 0, -vocoder_left_pad - vocoder_right_pad}, {3}), _var<int>({-1, -1, -1}, {3}));
++    mMelBuffer =
++        _Slice(mMelBuffer, _var<int>({0, 0, -vocoder_left_pad - vocoder_right_pad}, {3}), _var<int>({-1, -1, -1}, {3}));
+     mContext->audio_us += _t.durationInUs();
+     if (mWavformCallback) {
+         bool res = mWavformCallback(ptr, size, last_chunk);
+-        if (!res) { return; }
++        if (!res) {
++            return;
++        }
+     }
+     if (talker_done && !last_chunk) {
+         token2wav(true);
+@@ -1748,7 +1971,8 @@ VARP Talker::token2wav(const std::vector<int>& codec_tokens) {
+ }
+ 
+ void Talker::startAsyncWorker() {
+-    if (mWavWorkerRunning.exchange(true)) return; // already running
++    if (mWavWorkerRunning.exchange(true))
++        return; // already running
+     mDitWorkerThread = std::thread(&Talker::ditWorkerLoop, this);
+     mVocoderWorkerThread = std::thread(&Talker::vocoderWorkerLoop, this);
+ }
+@@ -1780,32 +2004,28 @@ void Talker::ditWorkerLoop() {
+         WavChunk chunk;
+         {
+             std::unique_lock<std::mutex> lock(mWavQueueMutex);
+-            mWavQueueCond.wait(lock, [this] {
+-                return !mWavQueue.empty() || !mWavWorkerRunning;
+-            });
+-            
++            mWavQueueCond.wait(lock, [this] { return !mWavQueue.empty() || !mWavWorkerRunning; });
++
+             if (!mWavWorkerRunning && mWavQueue.empty()) {
+                 break;
+             }
+-            
++
+             if (mWavQueue.empty()) {
+                 continue;
+             }
+-            
++
+             chunk = std::move(mWavQueue.front());
+             mWavQueue.pop();
+         }
+ 
+         if (!chunk.codec_tokens.empty()) {
+-            auto generated_mel = ditForwardAsync((int)chunk.codec_tokens.size(),
+-                chunk.codec_tokens.data(), chunk.noise.data());
+-            generated_mel = _Slice(generated_mel,
+-                _var<int>({0, 0, chunk.mel_slice_start}, {3}),
+-                _var<int>({-1, -1, chunk.mel_slice_size}, {3}));
++            auto generated_mel =
++                ditForwardAsync((int)chunk.codec_tokens.size(), chunk.codec_tokens.data(), chunk.noise.data());
++            generated_mel = _Slice(generated_mel, _var<int>({0, 0, chunk.mel_slice_start}, {3}),
++                                   _var<int>({-1, -1, chunk.mel_slice_size}, {3}));
+             auto mel_info = generated_mel->getInfo();
+             chunk.mel_dims = mel_info->dim;
+-            chunk.mel.assign(generated_mel->readMap<float>(),
+-                             generated_mel->readMap<float>() + mel_info->size);
++            chunk.mel.assign(generated_mel->readMap<float>(), generated_mel->readMap<float>() + mel_info->size);
+         }
+ 
+         {
+@@ -1841,9 +2061,7 @@ void Talker::vocoderWorkerLoop() {
+         WavChunk chunk;
+         {
+             std::unique_lock<std::mutex> lock(mMelQueueMutex);
+-            mMelQueueCond.wait(lock, [this] {
+-                return !mMelQueue.empty() || !mWavWorkerRunning;
+-            });
++            mMelQueueCond.wait(lock, [this] { return !mMelQueue.empty() || !mWavWorkerRunning; });
+             if (!mWavWorkerRunning && mMelQueue.empty()) {
+                 break;
+             }
+@@ -1928,20 +2146,16 @@ void Talker::processWavChunk(WavChunk& chunk) {
+     }
+     MNN::Timer _t;
+     auto generated_mel = _Const(chunk.mel.data(), chunk.mel_dims, NCHW, halide_type_of<float>());
+-    mMelBuffer = (mMelBuffer == nullptr) ?
+-        generated_mel : _Concat({mMelBuffer, generated_mel}, -1);
++    mMelBuffer = (mMelBuffer == nullptr) ? generated_mel : _Concat({mMelBuffer, generated_mel}, -1);
+ 
+     auto generated_waveform = bigvganForwardAsync(mMelBuffer);
+ 
+-    auto ptr = generated_waveform->readMap<float>()
+-        + vocoder_left_pad * vocoder_upsample_rate;
+-    auto size = generated_waveform->getInfo()->size
+-        - (vocoder_left_pad + vocoder_right_pad) * vocoder_upsample_rate;
++    auto ptr = generated_waveform->readMap<float>() + vocoder_left_pad * vocoder_upsample_rate;
++    auto size = generated_waveform->getInfo()->size - (vocoder_left_pad + vocoder_right_pad) * vocoder_upsample_rate;
+     mWaveformBuffer.insert(mWaveformBuffer.end(), ptr, ptr + size);
+     vocoder_left_pad = vocoder_left_context;
+-    mMelBuffer = _Slice(mMelBuffer,
+-        _var<int>({0, 0, -vocoder_left_pad - vocoder_right_pad}, {3}),
+-        _var<int>({-1, -1, -1}, {3}));
++    mMelBuffer =
++        _Slice(mMelBuffer, _var<int>({0, 0, -vocoder_left_pad - vocoder_right_pad}, {3}), _var<int>({-1, -1, -1}, {3}));
+     mContext->audio_us += _t.durationInUs();
+     if (mWavformCallback) {
+         mWavformCallback(ptr, size, chunk.is_last);
+@@ -1973,13 +2187,11 @@ void Talker::trySubmitChunkAsync(bool talker_done) {
+         int real_size = last_chunk ? codec_size : chunk_size;
+ 
+         WavChunk wav_chunk;
+-        wav_chunk.codec_tokens.assign(
+-            mContext->output_tokens.begin() + dit_start_index,
+-            mContext->output_tokens.begin() + dit_start_index + real_size);
++        wav_chunk.codec_tokens.assign(mContext->output_tokens.begin() + dit_start_index,
++                                      mContext->output_tokens.begin() + dit_start_index + real_size);
+         int noise_start = dit_start_index * 160;
+-        wav_chunk.noise.assign(
+-            mInitialNoise.begin() + noise_start,
+-            mInitialNoise.begin() + noise_start + real_size * 160);
++        wav_chunk.noise.assign(mInitialNoise.begin() + noise_start,
++                               mInitialNoise.begin() + noise_start + real_size * 160);
+         wav_chunk.mel_slice_start = dit_left_padding * 2;
+         wav_chunk.mel_slice_size = last_chunk ? -1 : dit_chunk_size * 2;
+         wav_chunk.is_last = last_chunk;
+@@ -2016,7 +2228,9 @@ int Talker::sample(Express::VARP logits, int offset, int size) {
+ void Talker::stepPrefill() {
+     CHECK_LLM_RUNNING(mContext);
+     MNN::Express::ExecutorScope s(mExecutor);
+-    if (!doGenerate()) { return; }
++    if (!doGenerate()) {
++        return;
++    }
+ 
+     mTalkerEmbeds.push_back(mTextEos);
+     auto input_embeds = _Concat({mTalkerEmbeds[0], mTextBos + mCodecPad, mTalkerEmbeds[1] + mCodecBos}, 1);
+@@ -2110,12 +2324,16 @@ void Talker::generate() {
+ }
+ 
+ void Talker::setPostionIds(const MropeInfo& positionIds) {
+-    if (!doGenerate()) { return; }
++    if (!doGenerate()) {
++        return;
++    }
+     mPositionIds = MropeInfo(positionIds);
+ }
+ 
+ void Talker::addTalkerEmbeds(VARP talker_embeds) {
+-    if (!doGenerate()) { return; }
++    if (!doGenerate()) {
++        return;
++    }
+     mTalkerEmbeds.push_back(_Clone(talker_embeds, true));
+ }
+ 
+diff --git a/transformers/llm/export/utils/vision.py b/transformers/llm/export/utils/vision.py
+index ec975f22..a0e7497e 100644
+--- a/transformers/llm/export/utils/vision.py
++++ b/transformers/llm/export/utils/vision.py
+@@ -267,11 +267,17 @@ class Qwen2Vision(Vision):
+         super().__init__(visual, base)
+         self.quant_bit = 4
+ 
++    def refresh_image_resize_config(self):
++        self.llm_config['image_size_unit'] = self.patch_size * self.merge_size
++        self.llm_config['image_min_pixels'] = self.min_pixels
++        self.llm_config['image_max_pixels'] = self.max_pixels
++
+     def load(self):
+         self.vision_start_id = self.config.vision_start_token_id
+         self.vision_end_id = self.config.vision_end_token_id
+         self.image_pad_id = self.config.image_token_id
+         self.llm_config['image_size'] = self.image_height
++        self.refresh_image_resize_config()
+         self.llm_config['vision_start'] = self.vision_start_id
+         self.llm_config['vision_end'] = self.vision_end_id
+         self.llm_config['image_pad'] = self.image_pad_id
+@@ -985,6 +991,7 @@ class Qwen3Vision(Qwen2Vision):
+ 
+         self.min_pixels = 65536
+         self.max_pixels = 16777216
++        self.refresh_image_resize_config()
+         self.merge_unit = self.merge_size * self.merge_size
+         self.deepstack_visual_indexes = visual.deepstack_visual_indexes
+         self.num_grid_per_side = visual.num_grid_per_side
+@@ -1151,6 +1158,7 @@ class Qwen3_5Vision(Qwen2Vision):
+ 
+         self.min_pixels = 65536
+         self.max_pixels = 16777216
++        self.refresh_image_resize_config()
+         self.merge_unit = self.merge_size * self.merge_size
+         self.num_grid_per_side = visual.num_grid_per_side
+         self.pos_embed = visual.pos_embed

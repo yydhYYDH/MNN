@@ -1,0 +1,50 @@
+diff --git a/transformers/llm/export/llmexport.py b/transformers/llm/export/llmexport.py
+index ec1b6787..14a97f8b 100644
+--- a/transformers/llm/export/llmexport.py
++++ b/transformers/llm/export/llmexport.py
+@@ -223,8 +223,14 @@ class LlmExporter(torch.nn.Module):
+         self.eagle = Eagle.get_eagle(self.model_type)(self.args.eagle_path, self.model)
+         eagle_onnx, eagle_fc_onnx = self.eagle.export(self.onnx_path)
+         if self.mnn_converter:
+-            MNNConverter(self, None).export(eagle_onnx)
+-            MNNConverter(self, None).export(eagle_fc_onnx)
++            origin_hqq = self.args.hqq
++            try:
++                self.args.hqq = self.args.eagle_hqq
++                MNNConverter(self, None).export(eagle_onnx)
++                self.args.hqq = self.args.eagle_fc_hqq
++                MNNConverter(self, None).export(eagle_fc_onnx)
++            finally:
++                self.args.hqq = origin_hqq
+ 
+     def export_dflash(self):
+         if not hasattr(self.args, 'dflash_path') or self.args.dflash_path is None:
+@@ -478,7 +484,7 @@ class LlmExporter(torch.nn.Module):
+             for i in range(len(self.model.blocks)):
+                 # different kv cache shape in different layers
+                 # if isinstance(self.config.num_attention_heads, list):
+-                self.model.blocks[i].self_attn.export_fused_attn = True
++                self.model.blocks[i].self_attn.export_fused_attn = os.environ.get("MNN_DISABLE_LLM_FUSED_ATTENTION") != "1"
+                 is_moe = hasattr(self.model.blocks[i].mlp, 'is_moe') and self.model.blocks[i].mlp.is_moe
+                 if is_moe:
+                     self.model.blocks[i].mlp.export_moe = True
+@@ -1318,7 +1324,7 @@ class EmbeddingExporter(LlmExporter):
+         if self.args.onnx_slim:
+             self.slim_onnx(onnx_model)
+         if export_mnn:
+-            transformer_fuse = not self.model.is_reranker
++            transformer_fuse = not self.model.is_reranker and os.environ.get("MNN_DISABLE_LLM_TRANSFORMER_FUSE") != "1"
+             tie_embeddings_info = MNNConverter(self, self.unloaded_ops).export(onnx_model, transformer_fuse=transformer_fuse)
+             if tie_embeddings_info is not None:
+                 self.llm_config['tie_embeddings'] = tie_embeddings_info
+@@ -1369,6 +1375,10 @@ def build_args(parser):
+     parser.add_argument('--ppl', action='store_true', help='Whether or not to get all logits of input tokens.')
+     parser.add_argument('--awq', action='store_true', help='Whether or not to use awq quant.')
+     parser.add_argument('--hqq', action='store_true', help='Whether or not to use hqq quant.')
++    parser.add_argument('--eagle_hqq', action='store_true',
++                        help='Whether or not to use hqq quant when converting eagle.mnn. This does not affect target llm.mnn.')
++    parser.add_argument('--eagle_fc_hqq', action='store_true',
++                        help='Whether or not to use hqq quant when converting eagle_fc.mnn. This does not affect target llm.mnn.')
+     parser.add_argument('--omni', action='store_true', help='Whether or not to use omni quant.')
+     parser.add_argument('--transformer_fuse', action='store_true', help='Whether or not to fuse vision transformer op.')
+     parser.add_argument('--group_conv_native', action='store_true', help='Whether or not to keep native group_conv.')
