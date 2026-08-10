@@ -91,6 +91,16 @@ Run commands from the directories expected by the project scripts.
 - For HMX paths, verify VTCM allocation sizes, tile counts, and descriptor counts before widening a tile or block.
 - Do not assume a micro-optimization is portable across v79/v81; build and test the target architecture.
 
+## QuRT Simulator Checks
+
+- Allocate buffers used by DSP DMA from aligned QuRT heap or mapped memory. Do not use writable sections of a
+  dynamically loaded runner `.so` as DMA input/output storage; the simulator can fault when the CPU accesses those
+  pages after DMA.
+- QuRT's runtime loader searches the simulator working directory for `DT_NEEDED` libraries. Stage the skel under its
+  SONAME and copy required DSP C++ runtimes (`libc++.so.1` and `libc++abi.so.1`) into that directory.
+- Do not trust a piped simulator command's shell status alone. Require the runner's correctness marker and
+  `Main() returned 0` in the captured log.
+
 ## DSP DMA-BUF Memory Measurement
 
 Use this when validating Hexagon/DSP memory footprint or comparing CPU vs `forwardtype=10`.
