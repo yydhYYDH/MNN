@@ -13,9 +13,9 @@ ErrorCode HexagonExecution::onResize(const std::vector<Tensor*>& inputs, const s
     mCmd.clear();
     mCmd.reserve(32);
     auto code = onBuildCmd(inputs, outputs, mCmd);
-#ifdef MNN_HEXAGON_OFFLINE_RPC
+#if defined(MNN_HEXAGON_OFFLINE_RPC) || defined(MNN_GPU_TIME_PROFILE)
     if (code != NO_ERROR) {
-        MNN_ERROR("[MNN::Hexagon][OfflineRPC] resize failed: op=%s code=%d\n", mOfflineDebugName.c_str(), code);
+        MNN_ERROR("[MNN::Hexagon] resize failed: op=%s code=%d\n", mDebugName.c_str(), code);
     }
 #endif
 #ifdef MNN_HEXAGON_ASAN
@@ -31,7 +31,7 @@ ErrorCode HexagonExecution::onResize(const std::vector<Tensor*>& inputs, const s
 ErrorCode HexagonExecution::onExecute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) {
     if (!mValid) {
 #ifdef MNN_HEXAGON_OFFLINE_RPC
-        MNN_ERROR("[MNN::Hexagon][OfflineRPC] invalid execution: op=%s\n", mOfflineDebugName.c_str());
+        MNN_ERROR("[MNN::Hexagon][OfflineRPC] invalid execution: op=%s\n", mDebugName.c_str());
 #endif
         return NOT_SUPPORT;
     }

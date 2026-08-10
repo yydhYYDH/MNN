@@ -694,7 +694,6 @@ int htp_execute_command(MmapManager* mmap_manager, const DSPCOMMAND::Command* co
                                               im2colParams);
             break;
         }
-#ifdef SIMULATOR_MOCK_HMX
         case DSP_OP_VISION_ATTENTION_FP16: {
             ret = htp_ops_vision_attention_fp16(mapped_ptrs[inputs->size()],
                                                 mapped_ptrs[0],
@@ -705,7 +704,6 @@ int htp_execute_command(MmapManager* mmap_manager, const DSPCOMMAND::Command* co
                                                 floatParams[4], intParams[5]);
             break;
         }
-#endif
         case DSP_OP_GET_INFO: {
             ret = htp_ops_getInfo_impl(mapped_ptrs[0]);
             break;

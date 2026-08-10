@@ -188,7 +188,6 @@ ErrorCode HexagonAttention::onBuildCmd(const std::vector<Tensor*>& inputs, const
     }
 #endif
     const bool streamingState = inputs.size() == 7 && outputs.size() == 3;
-#ifdef MNN_HEXAGON_OFFLINE_RPC
     const bool visionState = inputs.size() == 4 && outputs.size() == 1 && inputs[0] != nullptr &&
                              inputs[1] != nullptr && inputs[2] != nullptr && inputs[0]->dimensions() == 4 &&
                              inputs[1]->dimensions() == 4 && inputs[2]->dimensions() == 4;
@@ -225,7 +224,6 @@ ErrorCode HexagonAttention::onBuildCmd(const std::vector<Tensor*>& inputs, const
                          inputFds, {HexagonBackend::getDevicePtr(output)}, {Q, K, V, mask}, {output});
         return NO_ERROR;
     }
-#endif
     if (mMeta != nullptr && streamingState) {
         return NOT_SUPPORT;
     }

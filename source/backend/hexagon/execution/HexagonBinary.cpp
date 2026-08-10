@@ -168,19 +168,6 @@ ErrorCode HexagonBinary::onBuildCmd(const std::vector<Tensor*>& inputs, const st
     if (input0 == nullptr || input1 == nullptr || output == nullptr) {
         return INPUT_DATA_ERROR;
     }
-    if (mDspOpType == kBinaryModOpType) {
-        MNN_PRINT(
-            "[MNN::Hexagon] MOD build: in0(type=%d bits=%d dims=%d size=%zu format=%d) "
-            "in1(type=%d bits=%d dims=%d size=%zu format=%d) "
-            "out(type=%d bits=%d dims=%d size=%zu format=%d)\n",
-            input0->getType().code, input0->getType().bits, input0->dimensions(),
-            static_cast<size_t>(TensorUtils::getRawSize(input0)), TensorUtils::getDescribe(input0)->dimensionFormat,
-            input1->getType().code, input1->getType().bits, input1->dimensions(),
-            static_cast<size_t>(TensorUtils::getRawSize(input1)), TensorUtils::getDescribe(input1)->dimensionFormat,
-            output->getType().code, output->getType().bits, output->dimensions(),
-            static_cast<size_t>(TensorUtils::getRawSize(output)), TensorUtils::getDescribe(output)->dimensionFormat);
-    }
-
     if ((input0->getType().code != halide_type_float && input0->getType().code != halide_type_int) ||
         (input1->getType().code != halide_type_float && input1->getType().code != halide_type_int) ||
         (output->getType().code != halide_type_float && output->getType().code != halide_type_int)) {
