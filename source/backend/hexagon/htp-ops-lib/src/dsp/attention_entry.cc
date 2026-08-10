@@ -2,7 +2,6 @@
 
 #include <stdlib.h>
 
-#ifdef SIMULATOR_MOCK_HMX
 extern "C" AEEResult htp_ops_vision_attention_fp16(uint8_t* pOut, const uint8_t* pQ, const uint8_t* pK,
                                                     const uint8_t* pV, const uint8_t* pMask, int batch, int tokens,
                                                     int heads, int headDim, float scale, int maskStride) {
@@ -59,7 +58,6 @@ extern "C" AEEResult htp_ops_vision_attention_fp16(uint8_t* pOut, const uint8_t*
   free(scores);
   return AEE_SUCCESS;
 }
-#endif
 
 static void preprocess_mask_to_fp32(float* restrict dst, const __fp16* restrict src, int M, int mask_stride) {
   for (int m = 0; m < M; ++m) {

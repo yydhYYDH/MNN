@@ -176,17 +176,20 @@ Execution* HexagonBackend::onCreate(const std::vector<Tensor*>& inputs, const st
     //    }
     auto exe = HexagonExecutionFactory::create(op, inputs, outputs, this);
     if (nullptr != exe) {
-#ifdef MNN_HEXAGON_OFFLINE_RPC
+#if defined(MNN_HEXAGON_OFFLINE_RPC) || defined(MNN_GPU_TIME_PROFILE)
         std::string debugName = EnumNameOpType(op->type());
         debugName += ":";
         debugName += op->name() != nullptr ? op->name()->c_str() : "";
-        static_cast<HexagonExecution*>(exe)->setOfflineDebugName(debugName.c_str());
+        static_cast<HexagonExecution*>(exe)->setDebugName(debugName.c_str());
 #endif
         return exe;
     }
     if (op->type() == OpType_BinaryOp && op->main_as_BinaryOp() != nullptr) {
         MNN_ERROR("[MNN::Hexagon] unsupported BinaryOp subtype=%d activation=%d\n", op->main_as_BinaryOp()->opType(),
                   op->main_as_BinaryOp()->activationType());
+    } else {
+        MNN_ERROR("[MNN::Hexagon] unsupported op type=%s name=%s\n", EnumNameOpType(op->type()),
+                  op->name() != nullptr ? op->name()->c_str() : "");
     }
     mAllOpSupport = false;
     return nullptr;

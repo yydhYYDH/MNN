@@ -2,7 +2,7 @@
 #define HexagonExecution_hpp
 
 #include <vector>
-#ifdef MNN_HEXAGON_OFFLINE_RPC
+#if defined(MNN_HEXAGON_OFFLINE_RPC) || defined(MNN_GPU_TIME_PROFILE)
 #include <string>
 #endif
 
@@ -18,9 +18,9 @@ public:
 
     ErrorCode onResize(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) override;
     ErrorCode onExecute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) override;
-#ifdef MNN_HEXAGON_OFFLINE_RPC
-    void setOfflineDebugName(const char* name) {
-        mOfflineDebugName = name != nullptr ? name : "";
+#if defined(MNN_HEXAGON_OFFLINE_RPC) || defined(MNN_GPU_TIME_PROFILE)
+    void setDebugName(const char* name) {
+        mDebugName = name != nullptr ? name : "";
     }
 #endif
 
@@ -29,8 +29,8 @@ protected:
                                  std::vector<HexagonCommand>& dst) = 0;
 
     std::vector<HexagonCommand> mCmd;
-#ifdef MNN_HEXAGON_OFFLINE_RPC
-    std::string mOfflineDebugName;
+#if defined(MNN_HEXAGON_OFFLINE_RPC) || defined(MNN_GPU_TIME_PROFILE)
+    std::string mDebugName;
 #endif
 };
 
