@@ -22,6 +22,9 @@ void hmx_manager_reset() {
 }
 
 void hmx_manager_enable_execution() {
+#ifdef SIMULATOR_MOCK_HMX
+  return;
+#endif
   int hmx_mgr_ctx_id = vtcm_manager_get_ctx_id();
   if (!hmx_mgr_ctx_id) {
     return;
@@ -38,6 +41,9 @@ void hmx_manager_enable_execution() {
 }
 
 void hmx_manager_disable_execution() {
+#ifdef SIMULATOR_MOCK_HMX
+  return;
+#endif
   int hmx_mgr_ctx_id = vtcm_manager_get_ctx_id();
   if (!hmx_mgr_ctx_id) {
     return;

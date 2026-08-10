@@ -35,6 +35,7 @@ typedef enum {
   HTP_OPS_BINARY_GREATER = 9,
   HTP_OPS_BINARY_LESS = 10,
   HTP_OPS_BINARY_SQUARED_DIFFERENCE = 11,
+  HTP_OPS_BINARY_MOD = 12,
 } HtpOpsBinaryOpType;
 
 #define HTP_OPS_BINARY_DMA_CHUNK_BYTES (16 * 1024)
@@ -169,6 +170,8 @@ static inline int32_t htp_ops_binary_apply_int32(int32_t a, int32_t b, int opTyp
       return a > b ? 1 : 0;
     case HTP_OPS_BINARY_LESS:
       return a < b ? 1 : 0;
+    case HTP_OPS_BINARY_MOD:
+      return b == 0 ? 0 : a % b;
     default:
       return a;
   }

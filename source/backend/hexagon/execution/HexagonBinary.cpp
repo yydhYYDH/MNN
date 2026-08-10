@@ -13,6 +13,7 @@ static constexpr int kBinaryAddReluOpType = 8;
 static constexpr int kBinaryGreaterOpType = 9;
 static constexpr int kBinaryLessOpType = 10;
 static constexpr int kBinarySquaredDifferenceOpType = 11;
+static constexpr int kBinaryModOpType = 12;
 
 static bool _mapBinaryOp(int mnnOpType, int* dspOpType) {
     // Keep in sync with HtpOpsBinaryOpType in htp-ops-lib/src/dsp/blit_ops.c
@@ -47,6 +48,9 @@ static bool _mapBinaryOp(int mnnOpType, int* dspOpType) {
             return true;
         case BinaryOpOperation_SquaredDifference:
             *dspOpType = kBinarySquaredDifferenceOpType;
+            return true;
+        case BinaryOpOperation_MOD:
+            *dspOpType = kBinaryModOpType;
             return true;
         default:
             return false;
@@ -163,6 +167,18 @@ ErrorCode HexagonBinary::onBuildCmd(const std::vector<Tensor*>& inputs, const st
     const auto output = outputs[0];
     if (input0 == nullptr || input1 == nullptr || output == nullptr) {
         return INPUT_DATA_ERROR;
+    }
+    if (mDspOpType == kBinaryModOpType) {
+        MNN_PRINT(
+            "[MNN::Hexagon] MOD build: in0(type=%d bits=%d dims=%d size=%zu format=%d) "
+            "in1(type=%d bits=%d dims=%d size=%zu format=%d) "
+            "out(type=%d bits=%d dims=%d size=%zu format=%d)\n",
+            input0->getType().code, input0->getType().bits, input0->dimensions(),
+            static_cast<size_t>(TensorUtils::getRawSize(input0)), TensorUtils::getDescribe(input0)->dimensionFormat,
+            input1->getType().code, input1->getType().bits, input1->dimensions(),
+            static_cast<size_t>(TensorUtils::getRawSize(input1)), TensorUtils::getDescribe(input1)->dimensionFormat,
+            output->getType().code, output->getType().bits, output->dimensions(),
+            static_cast<size_t>(TensorUtils::getRawSize(output)), TensorUtils::getDescribe(output)->dimensionFormat);
     }
 
     if ((input0->getType().code != halide_type_float && input0->getType().code != halide_type_int) ||

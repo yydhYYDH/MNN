@@ -1,5 +1,66 @@
 #include "attention_private.hpp"
 
+#include <stdlib.h>
+
+#ifdef SIMULATOR_MOCK_HMX
+extern "C" AEEResult htp_ops_vision_attention_fp16(uint8_t* pOut, const uint8_t* pQ, const uint8_t* pK,
+                                                    const uint8_t* pV, const uint8_t* pMask, int batch, int tokens,
+                                                    int heads, int headDim, float scale, int maskStride) {
+  if (pOut == NULL || pQ == NULL || pK == NULL || pV == NULL || batch <= 0 || tokens <= 0 || heads <= 0 ||
+      headDim <= 0) {
+    return AEE_EBADPARM;
+  }
+  float* scores = (float*)malloc((size_t)tokens * sizeof(float));
+  if (scores == NULL) {
+    return AEE_ENOMEMORY;
+  }
+  const __fp16* query = (const __fp16*)pQ;
+  const __fp16* key = (const __fp16*)pK;
+  const __fp16* value = (const __fp16*)pV;
+  const __fp16* mask = (const __fp16*)pMask;
+  __fp16* output = (__fp16*)pOut;
+  const size_t tokenStride = (size_t)heads * headDim;
+  for (int b = 0; b < batch; ++b) {
+    for (int q = 0; q < tokens; ++q) {
+      for (int h = 0; h < heads; ++h) {
+        float maxScore = -INFINITY;
+        const __fp16* qPtr = query + ((size_t)b * tokens + q) * tokenStride + (size_t)h * headDim;
+        for (int k = 0; k < tokens; ++k) {
+          const __fp16* kPtr = key + ((size_t)b * tokens + k) * tokenStride + (size_t)h * headDim;
+          float score = 0.0f;
+          for (int d = 0; d < headDim; ++d) {
+            score += (float)qPtr[d] * (float)kPtr[d];
+          }
+          score *= scale;
+          if (mask != NULL && maskStride > 0) {
+            score += (float)mask[((size_t)b * tokens + q) * maskStride + k];
+          }
+          scores[k] = score;
+          maxScore = score > maxScore ? score : maxScore;
+        }
+        float sum = 0.0f;
+        for (int k = 0; k < tokens; ++k) {
+          scores[k] = expf(scores[k] - maxScore);
+          sum += scores[k];
+        }
+        const float invSum = sum > 0.0f ? 1.0f / sum : 0.0f;
+        __fp16* outPtr = output + ((size_t)b * tokens + q) * tokenStride + (size_t)h * headDim;
+        for (int d = 0; d < headDim; ++d) {
+          float result = 0.0f;
+          for (int k = 0; k < tokens; ++k) {
+            const __fp16* vPtr = value + ((size_t)b * tokens + k) * tokenStride + (size_t)h * headDim;
+            result += scores[k] * invSum * (float)vPtr[d];
+          }
+          outPtr[d] = (__fp16)result;
+        }
+      }
+    }
+  }
+  free(scores);
+  return AEE_SUCCESS;
+}
+#endif
+
 static void preprocess_mask_to_fp32(float* restrict dst, const __fp16* restrict src, int M, int mask_stride) {
   for (int m = 0; m < M; ++m) {
     const __fp16* src_row = src + (size_t)m * mask_stride;

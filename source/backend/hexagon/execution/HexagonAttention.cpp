@@ -1,5 +1,7 @@
 #include "HexagonRuntime.hpp"
 #include "HexagonAttention.hpp"
+
+#include <cmath>
 #include "backend/hexagon/backend/HexagonBackend.hpp"
 #include "MNN_generated.h"
 #include "core/TensorUtils.hpp"
@@ -15,8 +17,7 @@ namespace MNN {
 static constexpr int kFlashAttnPageTableInputIndex = 4;
 
 static int groupedCausalWorkspaceRows(int qoLen, int nHeads, int nKvHeads, int headDim, bool hasExplicitMask) {
-    if (hasExplicitMask || qoLen <= 8 || headDim % 64 != 0 ||
-        nKvHeads <= 0 || nHeads % nKvHeads != 0) {
+    if (hasExplicitMask || qoLen <= 8 || headDim % 64 != 0 || nKvHeads <= 0 || nHeads % nKvHeads != 0) {
         return 0;
     }
     const int gqaFactor = nHeads / nKvHeads;
@@ -50,6 +51,15 @@ struct FlashAttentionBlockParam {
     int chunk;
     int head_dim;
     float scale;
+};
+
+struct VisionAttentionParam {
+    int batch;
+    int tokens;
+    int heads;
+    int headDim;
+    float scale;
+    int maskStride;
 };
 
 static int flashAttentionBlockAlignUp(int value, int alignment) {
@@ -86,7 +96,7 @@ static size_t flashAttentionBlockWorkspaceBytes(int batch, int heads, int chunk,
     return offset;
 }
 
-HexagonAttention::HexagonAttention(Backend *backend, const Op *op) : HexagonExecution(backend) {
+HexagonAttention::HexagonAttention(Backend* backend, const Op* op) : HexagonExecution(backend) {
     auto param = op->main_as_AttentionParam();
     if (param) {
         mAttnScale = param->attnScale();
@@ -96,8 +106,7 @@ HexagonAttention::HexagonAttention(Backend *backend, const Op *op) : HexagonExec
     mMeta = (KVMeta*)(backend->getMetaPtr());
 }
 
-HexagonAttention::~HexagonAttention() {
-}
+HexagonAttention::~HexagonAttention() {}
 
 bool HexagonAttention::onClone(Backend* bn, const Op* op, Execution** dst) {
     if (nullptr == dst) {
@@ -158,9 +167,62 @@ void HexagonAttention::updatePageTable() {
     mSyncedPageGeneration = mKVCacheManager->pageGeneration();
 }
 
-ErrorCode HexagonAttention::onBuildCmd(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs,
+ErrorCode HexagonAttention::onBuildCmd(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
                                        std::vector<HexagonCommand>& dst) {
+#ifdef MNN_HEXAGON_OFFLINE_RPC
+    MNN_PRINT("[MNN::Hexagon][OfflineRPC] Attention shape: inputs=%zu outputs=%zu\n", inputs.size(), outputs.size());
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        if (inputs[i] == nullptr) {
+            MNN_PRINT("  input[%zu]=null\n", i);
+            continue;
+        }
+        MNN_PRINT("  input[%zu]: dims=%d [", i, inputs[i]->dimensions());
+        for (int d = 0; d < inputs[i]->dimensions(); ++d) {
+            MNN_PRINT("%s%d", d == 0 ? "" : ",", inputs[i]->length(d));
+        }
+        MNN_PRINT("] bytes=%d format=%d\n", HexagonBackend::getBytes(inputs[i]),
+                  TensorUtils::getDescribe(inputs[i])->dimensionFormat);
+    }
+#endif
     const bool streamingState = inputs.size() == 7 && outputs.size() == 3;
+#ifdef MNN_HEXAGON_OFFLINE_RPC
+    const bool visionState = inputs.size() == 4 && outputs.size() == 1 && inputs[0] != nullptr &&
+                             inputs[1] != nullptr && inputs[2] != nullptr && inputs[0]->dimensions() == 4 &&
+                             inputs[1]->dimensions() == 4 && inputs[2]->dimensions() == 4;
+    if (visionState) {
+        auto Q = inputs[0];
+        auto K = inputs[1];
+        auto V = inputs[2];
+        auto mask = inputs[3];
+        auto output = outputs[0];
+        if (Q->length(0) != K->length(0) || Q->length(0) != V->length(0) || Q->length(1) != K->length(1) ||
+            Q->length(1) != V->length(1) || Q->length(2) != K->length(2) || Q->length(2) != V->length(2) ||
+            Q->length(3) != K->length(3) || Q->length(3) != V->length(3) || HexagonBackend::getBytes(Q) != 2 ||
+            HexagonBackend::getBytes(K) != 2 || HexagonBackend::getBytes(V) != 2 ||
+            HexagonBackend::getBytes(output) != 2 || (mask != nullptr && HexagonBackend::getBytes(mask) != 2)) {
+            return NOT_SUPPORT;
+        }
+        TensorUtils::getDescribe(output)->dimensionFormat = MNN_DATA_FORMAT_NCHW;
+        const int tokens = Q->length(1);
+        int maskStride = 0;
+        if (mask != nullptr && mask->dimensions() >= 2) {
+            maskStride = mask->length(mask->dimensions() - 1);
+            if (maskStride != tokens) {
+                return NOT_SUPPORT;
+            }
+        }
+        const int headDim = Q->length(3);
+        const float scale = mAttnScale == 0.0f ? 1.0f / std::sqrt(static_cast<float>(headDim)) : mAttnScale;
+        VisionAttentionParam params = {Q->length(0), tokens, Q->length(2), headDim, scale, maskStride};
+        std::vector<std::pair<int, int>> inputFds = {
+            HexagonBackend::getDevicePtr(Q), HexagonBackend::getDevicePtr(K), HexagonBackend::getDevicePtr(V),
+            mask != nullptr ? HexagonBackend::getDevicePtr(mask) : std::make_pair(-1, 0)};
+        dst.emplace_back();
+        dst.back().build(static_cast<HexagonBackend*>(backend()), DSP_OP_VISION_ATTENTION_FP16, &params, sizeof(params),
+                         inputFds, {HexagonBackend::getDevicePtr(output)}, {Q, K, V, mask}, {output});
+        return NO_ERROR;
+    }
+#endif
     if (mMeta != nullptr && streamingState) {
         return NOT_SUPPORT;
     }
@@ -168,8 +230,8 @@ ErrorCode HexagonAttention::onBuildCmd(const std::vector<Tensor *> &inputs, cons
         auto Q = inputs[0];
         auto K = inputs[1];
         auto V = inputs[2];
-        if (Q == nullptr || K == nullptr || V == nullptr ||
-            inputs[4] == nullptr || inputs[5] == nullptr || inputs[6] == nullptr) {
+        if (Q == nullptr || K == nullptr || V == nullptr || inputs[4] == nullptr || inputs[5] == nullptr ||
+            inputs[6] == nullptr) {
             return INPUT_DATA_ERROR;
         }
         if (Q->dimensions() != 4 || K->dimensions() != 4 || V->dimensions() != 4) {
@@ -191,10 +253,8 @@ ErrorCode HexagonAttention::onBuildCmd(const std::vector<Tensor *> &inputs, cons
         const int tokens = Q->length(2);
         const int headDim = Q->length(3);
         const int chunk = K->length(1);
-        if (batch != K->length(0) || batch != V->length(0) ||
-            heads != K->length(2) || heads != V->length(2) ||
-            headDim != K->length(3) || headDim != V->length(3) ||
-            chunk != V->length(1)) {
+        if (batch != K->length(0) || batch != V->length(0) || heads != K->length(2) || heads != V->length(2) ||
+            headDim != K->length(3) || headDim != V->length(3) || chunk != V->length(1)) {
             return NOT_SUPPORT;
         }
         const float scale = (mAttnScale == 0.0f) ? (1.0f / sqrt(headDim)) : mAttnScale;
@@ -228,8 +288,8 @@ ErrorCode HexagonAttention::onBuildCmd(const std::vector<Tensor *> &inputs, cons
             commandInputs.emplace_back(input);
         }
         dst.emplace_back();
-        dst.back().build(static_cast<HexagonBackend*>(backend()), DSP_OP_FLASH_ATTENTION_BLOCK,
-                         &params, sizeof(params), inputFds, outputFds, commandInputs, commandOutputs);
+        dst.back().build(static_cast<HexagonBackend*>(backend()), DSP_OP_FLASH_ATTENTION_BLOCK, &params, sizeof(params),
+                         inputFds, outputFds, commandInputs, commandOutputs);
         if (mWorkspace) {
             backend()->onReleaseBuffer(mWorkspace.get(), Backend::DYNAMIC);
         }
@@ -242,8 +302,8 @@ ErrorCode HexagonAttention::onBuildCmd(const std::vector<Tensor *> &inputs, cons
     auto Q = inputs[0];
     auto K = inputs[1];
     auto V = inputs[2];
-    if (Q == nullptr || K == nullptr || V == nullptr ||
-        Q->dimensions() != 4 || K->dimensions() != 4 || V->dimensions() < 2) {
+    if (Q == nullptr || K == nullptr || V == nullptr || Q->dimensions() != 4 || K->dimensions() != 4 ||
+        V->dimensions() < 2) {
         return NOT_SUPPORT;
     }
     if (TensorUtils::getDescribe(Q)->dimensionFormat == MNN_DATA_FORMAT_NC4HW4 ||
@@ -251,8 +311,8 @@ ErrorCode HexagonAttention::onBuildCmd(const std::vector<Tensor *> &inputs, cons
         TensorUtils::getDescribe(V)->dimensionFormat != MNN_DATA_FORMAT_NC4HW4) {
         return NOT_SUPPORT;
     }
-    if (HexagonBackend::getBytes(Q) != 2 || HexagonBackend::getBytes(K) != 2 ||
-        HexagonBackend::getBytes(V) != 2 || HexagonBackend::getBytes(outputs[0]) != 2) {
+    if (HexagonBackend::getBytes(Q) != 2 || HexagonBackend::getBytes(K) != 2 || HexagonBackend::getBytes(V) != 2 ||
+        HexagonBackend::getBytes(outputs[0]) != 2) {
         return NOT_SUPPORT;
     }
     if (inputs.size() > 3 && inputs[3] != nullptr && inputs[3]->dimensions() > 2 &&
@@ -384,8 +444,8 @@ ErrorCode HexagonAttention::onBuildCmd(const std::vector<Tensor *> &inputs, cons
     int maskFd = maskDev.first;
     int maskOffset = maskDev.second;
 
-    FlashAttnParam params = {qo_len, seq_current, seq_add, n_heads, n_kv_heads, head_dim, scale, mask_stride,
-                             max_kv_len, page_count, page_size, mPageTableCapacity, 1};
+    FlashAttnParam params = {qo_len,      seq_current, seq_add,    n_heads,   n_kv_heads,         head_dim, scale,
+                             mask_stride, max_kv_len,  page_count, page_size, mPageTableCapacity, 1};
 
     auto pageTableDev = HexagonBackend::getDevicePtr(mPageTable.get());
     std::vector<std::pair<int, int>> attnInputFds = {qDev, kDev, vDev, {maskFd, maskOffset}, pageTableDev};
@@ -395,8 +455,8 @@ ErrorCode HexagonAttention::onBuildCmd(const std::vector<Tensor *> &inputs, cons
     std::vector<Tensor*> attnOutputs = {outputs[0], mWorkspace.get()};
 
     dst.emplace_back();
-    dst.back().build(static_cast<HexagonBackend*>(backend()), DSP_OP_FLASH_ATTN, &params, sizeof(params),
-                     attnInputFds, attnOutputFds, attnInputs, attnOutputs);
+    dst.back().build(static_cast<HexagonBackend*>(backend()), DSP_OP_FLASH_ATTN, &params, sizeof(params), attnInputFds,
+                     attnOutputFds, attnInputs, attnOutputs);
 
     backend()->onReleaseBuffer(mWorkspace.get(), Backend::DYNAMIC);
 

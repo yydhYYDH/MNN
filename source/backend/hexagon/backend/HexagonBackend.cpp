@@ -2,6 +2,7 @@
 #include "core/Execution.hpp"
 #include "core/TensorUtils.hpp"
 #include "HexagonBackend.hpp"
+#include "HexagonExecution.hpp"
 #include "HexagonRuntime.hpp"
 #include "HexagonExecutionFactory.hpp"
 #include "HexagonCommand.hpp"
@@ -111,14 +112,14 @@ static void _HexagonMemChunkApplyToTensor(uint8_t* ptr, size_t offset, Tensor* t
 }
 
 HexagonBackend::HexagonBackend(const Backend::Info& info, const Runtime* runtime)
-    : Backend(MNN_FORWARD_HEXAGON)
-    , mRuntime(static_cast<const HexagonRuntime*>(runtime)) {
+    : Backend(MNN_FORWARD_HEXAGON), mRuntime(static_cast<const HexagonRuntime*>(runtime)) {
     if (mRuntime->mDynamicBuffer.root == nullptr) {
         mRuntime->mDynamicBuffer.root = BufferAllocator::Allocator::createRecurse(mRuntime->mStaticAlloc.get());
     }
     mDynamicAlloc.reset(new DeferBufferAllocator(&mRuntime->mDynamicBuffer, 128, _HexagonMemChunkApplyToTensor));
     mDynamicGeneration.reset(new size_t(0));
-    std::shared_ptr<BufferAllocator> separateAlloc(new EagerBufferAllocator(BufferAllocator::Allocator::createRecurse(mRuntime->mStaticAlloc.get()), 128));
+    std::shared_ptr<BufferAllocator> separateAlloc(
+        new EagerBufferAllocator(BufferAllocator::Allocator::createRecurse(mRuntime->mStaticAlloc.get()), 128));
 #ifdef MNN_HEXAGON_ASAN
     separateAlloc = HexagonRuntime::asanWrapAllocator(separateAlloc, "separate");
 #endif
@@ -129,25 +130,22 @@ HexagonBackend::HexagonBackend(const Backend::Info& info, const Runtime* runtime
 HexagonBackend::~HexagonBackend() {
     flushCommand();
     // TODO:
-
 }
 class EmptyExe : public Execution {
 private:
     std::shared_ptr<Execution> mOriginExe;
+
 public:
-    EmptyExe(Backend *backend) : Execution(backend) {
-    }
+    EmptyExe(Backend* backend) : Execution(backend) {}
     virtual ~EmptyExe() = default;
 
-    virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
+    virtual ErrorCode onResize(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) {
         return NO_ERROR;
     }
-    virtual ErrorCode onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
+    virtual ErrorCode onExecute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) {
         return NO_ERROR;
     }
-    virtual bool onClone(Backend* bn, const Op* op, Execution** dst) {
-        return NO_ERROR;
-    }
+    virtual bool onClone(Backend* bn, const Op* op, Execution** dst) { return NO_ERROR; }
 };
 
 BufferAllocator* HexagonBackend::getAllocator(int type) const {
@@ -161,25 +159,34 @@ BufferAllocator* HexagonBackend::getAllocator(int type) const {
     }
 }
 
-Execution* HexagonBackend::onCreate(const std::vector<Tensor*>& inputs,
-                                    const std::vector<Tensor*>& outputs,
+Execution* HexagonBackend::onCreate(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
                                     const MNN::Op* op) {
-//    std::set<OpType> validOpSets {
+    //    std::set<OpType> validOpSets {
     //        OpType_RoPE,
-//        OpType_LayerNorm,
-//        OpType_BinaryOp,
-//        OpType_While,
-//        OpType_Convolution,
-//        OpType_Attention,
-//        OpType_Scale,
-//        OpType_Raster,
-//    };
-//    if (validOpSets.find(op->type()) == validOpSets.end()) {
-//        return nullptr;
-//    }
+    //        OpType_LayerNorm,
+    //        OpType_BinaryOp,
+    //        OpType_While,
+    //        OpType_Convolution,
+    //        OpType_Attention,
+    //        OpType_Scale,
+    //        OpType_Raster,
+    //    };
+    //    if (validOpSets.find(op->type()) == validOpSets.end()) {
+    //        return nullptr;
+    //    }
     auto exe = HexagonExecutionFactory::create(op, inputs, outputs, this);
     if (nullptr != exe) {
+#ifdef MNN_HEXAGON_OFFLINE_RPC
+        std::string debugName = EnumNameOpType(op->type());
+        debugName += ":";
+        debugName += op->name() != nullptr ? op->name()->c_str() : "";
+        static_cast<HexagonExecution*>(exe)->setOfflineDebugName(debugName.c_str());
+#endif
         return exe;
+    }
+    if (op->type() == OpType_BinaryOp && op->main_as_BinaryOp() != nullptr) {
+        MNN_ERROR("[MNN::Hexagon] unsupported BinaryOp subtype=%d activation=%d\n", op->main_as_BinaryOp()->opType(),
+                  op->main_as_BinaryOp()->activationType());
     }
     mAllOpSupport = false;
     return nullptr;
@@ -213,8 +220,7 @@ void HexagonBackend::onExecuteBegin() const {
     mRuntime->pCurrentStatus = res;
 }
 
-void HexagonBackend::onExecuteEnd() const {
-}
+void HexagonBackend::onExecuteEnd() const {}
 
 const Runtime* HexagonBackend::getRuntime() {
     return mRuntime;
@@ -354,7 +360,7 @@ void HexagonBackend::fp32ToFp16(const float* src, int16_t* dst, size_t size) {
             : "cc", "memory", "x10", "x11", "v0", "v30", "v31");
     }
     i += ((size - i) / 4) * 4;
-#else
+#elif (defined(__ARM_NEON) || defined(__ARM_NEON__)) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
     const float32x4_t minValue = vdupq_n_f32(-65504.0f);
     const float32x4_t maxValue = vdupq_n_f32(65504.0f);
     for (; i + 16 <= size; i += 16) {
@@ -432,7 +438,7 @@ void HexagonBackend::fp16ToFp32(const int16_t* src, float* dst, size_t size) {
             : "cc", "memory", "v0", "v4");
     }
     i += ((size - i) / 4) * 4;
-#else
+#elif (defined(__ARM_NEON) || defined(__ARM_NEON__)) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
     for (; i + 16 <= size; i += 16) {
         const float16x4_t h0 = vreinterpret_f16_u16(vld1_u16(srcU16 + i));
         const float16x4_t h1 = vreinterpret_f16_u16(vld1_u16(srcU16 + i + 4));
@@ -532,12 +538,19 @@ Backend::MemObj* HexagonBackend::onAcquire(const Tensor* tensor, StorageType sto
         HexagonMemObj(MemChunk c, std::shared_ptr<BufferAllocator> alloc, const HexagonRuntime* runtime,
                       std::shared_ptr<size_t> generation = nullptr
 #ifdef MNN_HEXAGON_ASAN
-                      , const HexagonBackend* backend = nullptr, const Tensor* tensor = nullptr, bool asanDynamic = false
+                      ,
+                      const HexagonBackend* backend = nullptr, const Tensor* tensor = nullptr, bool asanDynamic = false
 #endif
                       )
-            : mChunk(c), mAlloc(alloc), mRuntime(runtime), mGeneration(generation)
+            : mChunk(c),
+              mAlloc(alloc),
+              mRuntime(runtime),
+              mGeneration(generation)
 #ifdef MNN_HEXAGON_ASAN
-            , mBackend(backend), mTensor(tensor), mAsanDynamic(asanDynamic)
+              ,
+              mBackend(backend),
+              mTensor(tensor),
+              mAsanDynamic(asanDynamic)
 #endif
         {
             if (mGeneration) {
@@ -559,6 +572,7 @@ Backend::MemObj* HexagonBackend::onAcquire(const Tensor* tensor, StorageType sto
 #endif
             mAlloc->free(mChunk);
         }
+
     private:
         MemChunk mChunk;
         std::shared_ptr<BufferAllocator> mAlloc;
@@ -580,9 +594,10 @@ Backend::MemObj* HexagonBackend::onAcquire(const Tensor* tensor, StorageType sto
     }
     return new HexagonMemObj(chunk, mDynamicAlloc, mRuntime, mDynamicGeneration
 #ifdef MNN_HEXAGON_ASAN
-                             , this, tensor, true
+                             ,
+                             this, tensor, true
 #endif
-                             );
+    );
 }
 
 bool HexagonBackend::onClearBuffer() {
@@ -627,7 +642,7 @@ static size_t getNc4hw4DeviceElementCount(const Tensor* tensor, int pack) {
 }
 
 static void nc4hw4HostToDevice(const float* src, int16_t* dst, const Tensor* tensor, int pack,
-                               void(*fp32tofp16)(const float*, int16_t*, size_t)) {
+                               void (*fp32tofp16)(const float*, int16_t*, size_t)) {
     int n = tensor->dimensions() > 0 ? tensor->length(0) : 1;
     int c = tensor->dimensions() > 1 ? tensor->length(1) : 1;
     int h = tensor->dimensions() > 2 ? tensor->length(2) : 1;
@@ -689,7 +704,7 @@ static void nc4hw4HostToDevice(const float* src, int16_t* dst, const Tensor* ten
 }
 
 static void nc4hw4DeviceToHost(const int16_t* src, float* dst, const Tensor* tensor, int pack,
-                               void(*fp16tofp32)(const int16_t*, float*, size_t)) {
+                               void (*fp16tofp32)(const int16_t*, float*, size_t)) {
     int n = tensor->dimensions() > 0 ? tensor->length(0) : 1;
     int c = tensor->dimensions() > 1 ? tensor->length(1) : 1;
     int h = tensor->dimensions() > 2 ? tensor->length(2) : 1;
@@ -715,9 +730,8 @@ static void nc4hw4DeviceToHost(const int16_t* src, float* dst, const Tensor* ten
     fp16tofp32(srcFp16.data(), dst, hostElementCount);
 }
 
-
 static void nchwHostToDevice(const float* src, int16_t* dst, const Tensor* tensor, int pack,
-                               void(*fp32tofp16)(const float*, int16_t*, size_t)) {
+                             void (*fp32tofp16)(const float*, int16_t*, size_t)) {
     int n = tensor->dimensions() > 0 ? tensor->length(0) : 1;
     int c = tensor->dimensions() > 1 ? tensor->length(1) : 1;
     int h = tensor->dimensions() > 2 ? tensor->length(2) : 1;
@@ -759,7 +773,7 @@ static void nchwHostToDevice(const float* src, int16_t* dst, const Tensor* tenso
 }
 
 static void deviceToNchwHost(const int16_t* src, float* dst, const Tensor* tensor, int pack,
-                               void(*fp16tofp32)(const int16_t*, float*, size_t)) {
+                             void (*fp16tofp32)(const int16_t*, float*, size_t)) {
     int n = tensor->dimensions() > 0 ? tensor->length(0) : 1;
     int c = tensor->dimensions() > 1 ? tensor->length(1) : 1;
     int h = tensor->dimensions() > 2 ? tensor->length(2) : 1;
@@ -813,12 +827,20 @@ void HexagonBackend::onCopyBuffer(const Tensor* srcTensor, const Tensor* dstTens
     } else if (dstType == MNN_FORWARD_HEXAGON) {
         profileDirection = 2;
     }
-#define MNN_HEXAGON_RECORD_COPY_BUFFER() \
-    do { mRuntime->recordCopyBuffer(profileDirection, profileBytes, copyTimer.durationInUs(), copyFlushUs); } while (0)
-#define MNN_HEXAGON_PROFILE_FLUSH_COMMAND() \
-    do { Timer flushTimer; flushCommand(); copyFlushUs += flushTimer.durationInUs(); } while (0)
+#define MNN_HEXAGON_RECORD_COPY_BUFFER()                                                                   \
+    do {                                                                                                   \
+        mRuntime->recordCopyBuffer(profileDirection, profileBytes, copyTimer.durationInUs(), copyFlushUs); \
+    } while (0)
+#define MNN_HEXAGON_PROFILE_FLUSH_COMMAND()       \
+    do {                                          \
+        Timer flushTimer;                         \
+        flushCommand();                           \
+        copyFlushUs += flushTimer.durationInUs(); \
+    } while (0)
 #else
-#define MNN_HEXAGON_RECORD_COPY_BUFFER() do {} while (0)
+#define MNN_HEXAGON_RECORD_COPY_BUFFER() \
+    do {                                 \
+    } while (0)
 #define MNN_HEXAGON_PROFILE_FLUSH_COMMAND() flushCommand()
 #endif
     if (srcType == MNN_FORWARD_HEXAGON && dstType == MNN_FORWARD_HEXAGON) {
@@ -1011,4 +1033,4 @@ void HexagonBackend::flushCommand() const {
     }
     mRuntime->flushCommand();
 }
-}
+} // namespace MNN
