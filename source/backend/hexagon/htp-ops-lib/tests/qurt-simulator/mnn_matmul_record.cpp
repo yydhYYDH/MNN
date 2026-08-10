@@ -56,7 +56,8 @@ int createModel(const char *modelPath, int inputChannels) {
   return 0;
 }
 
-int runModel(const char *modelPath, MNNForwardType backend, const char *outputPath, bool verifyGeneratedModel) {
+int runModel(const char *modelPath, MNNForwardType backend, const char *outputPath, bool verifyGeneratedModel,
+             const char *inputPath = nullptr) {
   std::shared_ptr<Interpreter> interpreter(Interpreter::createFromFile(modelPath), Interpreter::destroy);
   if (!interpreter) {
     fprintf(stderr, "Unable to load MNN model: %s\n", modelPath);
@@ -72,7 +73,8 @@ int runModel(const char *modelPath, MNNForwardType backend, const char *outputPa
     fprintf(stderr, "Unable to create backend session: %d\n", backend);
     return 3;
   }
-  if (backend == MNN_FORWARD_HEXAGON && getenv("MNN_HEXAGON_OFFLINE_RPC_PATH") != nullptr) {
+  const bool recordOffline = backend == MNN_FORWARD_HEXAGON && getenv("MNN_HEXAGON_OFFLINE_RPC_PATH") != nullptr;
+  if (recordOffline) {
     Tensor           *output      = interpreter->getSessionOutput(session, "output");
     const std::string outputBytes = std::to_string(output->elementSize() * sizeof(uint16_t));
     setenv("MNN_HEXAGON_OFFLINE_RPC_OUTPUT_BYTES", outputBytes.c_str(), 1);
@@ -80,14 +82,27 @@ int runModel(const char *modelPath, MNNForwardType backend, const char *outputPa
   Tensor   *input         = interpreter->getSessionInput(session, "input");
   const int inputChannels = input->length(1);
   Tensor    hostInput(input, input->getDimensionType());
-  for (int channel = 0; channel < inputChannels; ++channel) {
-    for (int row = 0; row < kRows; ++row) {
-      hostInput.host<float>()[channel * kRows + row] = inputValue(row, channel);
+  if (inputPath != nullptr) {
+    std::ifstream file(inputPath, std::ios::binary | std::ios::ate);
+    if (!file || file.tellg() != static_cast<std::streamoff>(hostInput.size())) {
+      fprintf(stderr, "Input size mismatch: %s\n", inputPath);
+      return 7;
+    }
+    file.seekg(0);
+    file.read(reinterpret_cast<char *>(hostInput.host<float>()), hostInput.size());
+    if (!file) {
+      return 8;
+    }
+  } else {
+    for (int channel = 0; channel < inputChannels; ++channel) {
+      for (int row = 0; row < kRows; ++row) {
+        hostInput.host<float>()[channel * kRows + row] = inputValue(row, channel);
+      }
     }
   }
   input->copyFromHostTensor(&hostInput);
   const ErrorCode code = interpreter->runSession(session);
-  if (code != NO_ERROR && backend != MNN_FORWARD_HEXAGON) {
+  if (code != NO_ERROR && !recordOffline) {
     fprintf(stderr, "MNN run failed: backend=%d code=%d\n", backend, code);
     return 4;
   }
@@ -131,7 +146,8 @@ int runVisionBlock(const char *modelPath, MNNForwardType backend, const char *ou
   if (!session) {
     return 3;
   }
-  if (backend == MNN_FORWARD_HEXAGON && getenv("MNN_HEXAGON_OFFLINE_RPC_PATH") != nullptr) {
+  const bool recordOffline = backend == MNN_FORWARD_HEXAGON && getenv("MNN_HEXAGON_OFFLINE_RPC_PATH") != nullptr;
+  if (recordOffline) {
     Tensor           *output      = interpreter->getSessionOutput(session, "output");
     const std::string outputBytes = std::to_string(output->elementSize() * sizeof(uint16_t));
     setenv("MNN_HEXAGON_OFFLINE_RPC_OUTPUT_BYTES", outputBytes.c_str(), 1);
@@ -166,7 +182,7 @@ int runVisionBlock(const char *modelPath, MNNForwardType backend, const char *ou
   }
 
   const ErrorCode code = interpreter->runSession(session);
-  if (code != NO_ERROR && backend != MNN_FORWARD_HEXAGON) {
+  if (code != NO_ERROR && !recordOffline) {
     fprintf(stderr, "Vision block run failed: backend=%d code=%d\n", backend, code);
     return 4;
   }
@@ -200,8 +216,17 @@ int main(int argc, char **argv) {
   if (argc == 4 && strcmp(argv[1], "cpu-model") == 0) {
     return runModel(argv[2], MNN_FORWARD_CPU, argv[3], false);
   }
+  if (argc == 5 && strcmp(argv[1], "cpu-model-input") == 0) {
+    return runModel(argv[2], MNN_FORWARD_CPU, argv[4], false, argv[3]);
+  }
   if (argc == 3 && strcmp(argv[1], "record-model") == 0) {
     return runModel(argv[2], MNN_FORWARD_HEXAGON, nullptr, false);
+  }
+  if (argc == 4 && strcmp(argv[1], "hexagon-model") == 0) {
+    return runModel(argv[2], MNN_FORWARD_HEXAGON, argv[3], false);
+  }
+  if (argc == 5 && strcmp(argv[1], "hexagon-model-input") == 0) {
+    return runModel(argv[2], MNN_FORWARD_HEXAGON, argv[4], false, argv[3]);
   }
   if (argc == 4 && strcmp(argv[1], "cpu-block") == 0) {
     return runVisionBlock(argv[2], MNN_FORWARD_CPU, argv[3]);
@@ -209,9 +234,14 @@ int main(int argc, char **argv) {
   if (argc == 3 && strcmp(argv[1], "record-block") == 0) {
     return runVisionBlock(argv[2], MNN_FORWARD_HEXAGON, nullptr);
   }
+  if (argc == 4 && strcmp(argv[1], "hexagon-block") == 0) {
+    return runVisionBlock(argv[2], MNN_FORWARD_HEXAGON, argv[3]);
+  }
   fprintf(stderr,
           "Usage: %s create MODEL [K] | cpu MODEL REFERENCE | record MODEL | cpu-model MODEL REFERENCE | "
-          "record-model MODEL | cpu-block MODEL REFERENCE | record-block MODEL\n",
+          "cpu-model-input MODEL INPUT OUTPUT | "
+          "record-model MODEL | hexagon-model MODEL OUTPUT | hexagon-model-input MODEL INPUT OUTPUT | "
+          "cpu-block MODEL REFERENCE | record-block MODEL | hexagon-block MODEL OUTPUT\n",
           argv[0]);
   return 64;
 }
