@@ -36,6 +36,9 @@ PREBUILT_LIB_DIR="hexagon_toolv${TOOLS_MAJOR}_${DSP_ARCH}"
 TOOLCHAIN_FILE="${SDK_ROOT}/build/cmake/hexagon_toolchain.cmake"
 SKEL_BUILD_DIR="${BUILD_ROOT}/skel"
 RUNNER_BUILD_DIR="${BUILD_ROOT}/runner"
+HOST_BUILD_DIR="${BUILD_ROOT}/host"
+REQUEST_FILE="${RUNNER_BUILD_DIR}/offline_rpc_request.bin"
+RESPONSE_FILE="${RUNNER_BUILD_DIR}/offline_rpc_response.bin"
 
 COMMON_CMAKE_ARGS=(
     -G Ninja
@@ -63,9 +66,23 @@ if [[ ! -f "${SKEL_SO}" ]]; then
     exit 3
 fi
 
+cmake -S "${SCRIPT_DIR}" -B "${HOST_BUILD_DIR}" -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release -DMNN_OFFLINE_RPC_HOST_ONLY=ON
+cmake --build "${HOST_BUILD_DIR}" --target mnn_htp_offline_rpc_host -j"${MNN_QURT_SIM_JOBS:-4}"
+
 cmake -S "${SCRIPT_DIR}" -B "${RUNNER_BUILD_DIR}" "${COMMON_CMAKE_ARGS[@]}" \
     "-DMNN_HTPOPS_SKEL=${SKEL_SO}"
 cmake --build "${RUNNER_BUILD_DIR}" --target mnn_htp_qurt_runner -j"${MNN_QURT_SIM_JOBS:-4}"
+rm -f "${REQUEST_FILE}" "${RESPONSE_FILE}"
+if [[ -n "${MNN_OFFLINE_RPC_REQUEST:-}" ]]; then
+    cp "${MNN_OFFLINE_RPC_REQUEST}" "${REQUEST_FILE}"
+    INSPECT_LOG="${BUILD_ROOT}/offline_rpc_inspect.txt"
+    "${HOST_BUILD_DIR}/mnn_htp_offline_rpc_host" inspect "${REQUEST_FILE}" > "${INSPECT_LOG}"
+    head -n 1 "${INSPECT_LOG}"
+    echo "Full request inspection: ${INSPECT_LOG}"
+else
+    "${HOST_BUILD_DIR}/mnn_htp_offline_rpc_host" create "${REQUEST_FILE}"
+fi
 
 SIMULATOR="${TOOLS_ROOT}/Tools/bin/hexagon-sim"
 SIM_COMPAT_DIR="${BUILD_ROOT}/sim-compat"
@@ -80,13 +97,22 @@ if ldd "${SIMULATOR}" 2>/dev/null | grep -q 'libncurses.so.5 => not found'; then
 fi
 
 export LD_LIBRARY_PATH="${SIM_COMPAT_DIR}:${TOOLS_ROOT}/Tools/lib/iss:${LD_LIBRARY_PATH:-}"
+SIM_START_SECONDS="${SECONDS}"
 cmake --build "${RUNNER_BUILD_DIR}" --target runOnSimulator
+SIM_WALL_SECONDS="$((SECONDS - SIM_START_SECONDS))"
+if [[ -z "${MNN_OFFLINE_RPC_REQUEST:-}" ]]; then
+    "${HOST_BUILD_DIR}/mnn_htp_offline_rpc_host" verify "${RESPONSE_FILE}"
+fi
+if [[ -n "${MNN_OFFLINE_RPC_REFERENCE:-}" ]]; then
+    "${HOST_BUILD_DIR}/mnn_htp_offline_rpc_host" verify-reference "${RESPONSE_FILE}" "${MNN_OFFLINE_RPC_REFERENCE}"
+fi
+echo "Offline RPC simulator wall time: ${SIM_WALL_SECONDS} s"
 
 LOG_FILE="${BUILD_ROOT}/sim_run_logs.txt"
 if [[ ! -f "${LOG_FILE}" ]]; then
     LOG_FILE="${RUNNER_BUILD_DIR}/../sim_run_logs.txt"
 fi
-if ! grep -q 'mock_matmul: err=0 bad=0' "${LOG_FILE}" || ! grep -q 'Main() returned 0' "${LOG_FILE}"; then
+if ! grep -q 'offline_rpc_graph: err=0' "${LOG_FILE}" || ! grep -q 'Main() returned 0' "${LOG_FILE}"; then
     echo "QuRT simulator smoke test did not report a clean result: ${LOG_FILE}" >&2
     exit 5
 fi

@@ -6,126 +6,214 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "offline_rpc_protocol.h"
+
 extern "C" {
 AEEResult htp_ops_open(const char *uri, remote_handle64 *handle);
 AEEResult htp_ops_close(remote_handle64 handle);
 AEEResult htp_ops_init_backend(remote_handle64 handle);
 AEEResult htp_ops_get_skel_arch(remote_handle64 handle, uint32 *arch);
-int       vtcm_manager_acquire(void);
-void      vtcm_manager_release(void);
-int hmx_matmulq4fp16_mle32(uint8_t *output, const uint8_t *activation, const uint8_t *weight, const uint8_t *scale,
-                           const uint8_t *bias, int m, int k, int n, int mp, int np, int kp, int scaleBlockNum,
-                           int scaleAsymmetric);
+int       htp_ops_execute_offline_command(const uint8_t *commandData, const int *bufferIds, void *const *bufferPtrs,
+                                          int bufferCount);
 }
 
 static constexpr int kSize          = 32;
 static constexpr int kMeasuredRuns  = 5;
+static constexpr int kMaxBuffers    = 64;
+static constexpr int kMaxCommands   = 4096;
 static uint64        gAverageCycles = 0;
 static uint64        gAverageTicks  = 0;
 static int           gBadResults    = -1;
 static uint16        gFirstResult   = 0;
 
-static int runMockMatMulBenchmark() {
-  const size_t activationBytes = kSize * 64 * sizeof(__fp16);
-  const size_t outputBytes     = kSize * 64 * sizeof(__fp16);
-  const size_t weightBytes     = kSize * kSize / 2;
-  const size_t vectorBytes     = kSize * sizeof(__fp16);
+static bool readExact(FILE *file, void *data, size_t size) {
+  return fread(data, 1, size, file) == size;
+}
 
-  __fp16  *activation = (__fp16 *) memalign(2048, activationBytes);
-  uint8_t *weight     = (uint8_t *) memalign(2048, weightBytes);
-  __fp16  *scale      = (__fp16 *) memalign(256, vectorBytes);
-  __fp16  *bias       = (__fp16 *) memalign(256, vectorBytes);
-  __fp16  *output     = (__fp16 *) memalign(2048, outputBytes);
-  if (!activation || !weight || !scale || !bias || !output) {
-    free(output);
-    free(bias);
-    free(scale);
-    free(weight);
-    free(activation);
+static bool writeExact(FILE *file, const void *data, size_t size) {
+  return fwrite(data, 1, size, file) == size;
+}
+
+static int runOfflineCommand() {
+  FILE                   *request = fopen("offline_rpc_request.bin", "rb");
+  OfflineRpcRequestHeader header  = {};
+  if (!request || !readExact(request, &header, sizeof(header)) || header.magic != kOfflineRpcRequestMagic ||
+      header.version != kOfflineRpcVersion || header.bufferCount == 0 || header.bufferCount > kMaxBuffers ||
+      header.commandCount == 0 || header.commandCount > kMaxCommands) {
+    if (request) {
+      fclose(request);
+    }
+    return 5;
+  }
+  OfflineRpcBufferDesc descs[kMaxBuffers] = {};
+  if (!readExact(request, descs, header.bufferCount * sizeof(descs[0]))) {
+    fclose(request);
+    return 6;
+  }
+  OfflineRpcCommandDesc commandDescs[kMaxCommands] = {};
+  if (!readExact(request, commandDescs, header.commandCount * sizeof(commandDescs[0]))) {
+    fclose(request);
+    return 7;
+  }
+  printf("offline_rpc_load: buffers=%lu commands=%lu\n", (unsigned long) header.bufferCount,
+         (unsigned long) header.commandCount);
+  fflush(stdout);
+  uint8_t *commands[kMaxCommands] = {};
+  int      ids[kMaxBuffers]       = {};
+  void    *ptrs[kMaxBuffers]      = {};
+  int      outputIndex            = -1;
+  uint64   memalignTicks          = 0;
+  uint64   memsetTicks            = 0;
+  uint64   freadTicks             = 0;
+  uint64   logicalBytes           = 0;
+  uint64   storedBytes            = 0;
+  uint64   chunkCount             = 0;
+  for (uint32_t i = 0; i < header.commandCount; ++i) {
+    if (commandDescs[i].size == 0 || commandDescs[i].size > 65536) {
+      fclose(request);
+      return 7;
+    }
+    commands[i] = (uint8_t *) memalign(128, commandDescs[i].size);
+    if (!commands[i] || !readExact(request, commands[i], commandDescs[i].size)) {
+      fclose(request);
+      for (uint32_t j = 0; j <= i; ++j) {
+        free(commands[j]);
+      }
+      return 7;
+    }
+  }
+  for (uint32_t i = 0; i < header.bufferCount; ++i) {
+    printf("offline_rpc_load: buffer=%lu/%lu id=%ld logical_bytes=%lu chunks=%lu\n", (unsigned long) (i + 1),
+           (unsigned long) header.bufferCount, (long) descs[i].id, (unsigned long) descs[i].logicalSize,
+           (unsigned long) descs[i].chunkCount);
+    fflush(stdout);
+    ids[i]           = descs[i].id;
+    uint64 tickStart = HAP_perf_get_qtimer_count();
+    ptrs[i]          = memalign(descs[i].alignment, descs[i].logicalSize);
+    memalignTicks += HAP_perf_get_qtimer_count() - tickStart;
+    if (!ptrs[i]) {
+      fclose(request);
+      for (uint32_t j = 0; j <= i; ++j) {
+        free(ptrs[j]);
+      }
+      for (uint32_t j = 0; j < header.commandCount; ++j) {
+        free(commands[j]);
+      }
+      return 8;
+    }
+    tickStart = HAP_perf_get_qtimer_count();
+    memset(ptrs[i], 0, descs[i].logicalSize);
+    memsetTicks += HAP_perf_get_qtimer_count() - tickStart;
+    logicalBytes += descs[i].logicalSize;
+    for (uint32_t chunkIndex = 0; chunkIndex < descs[i].chunkCount; ++chunkIndex) {
+      OfflineRpcChunkDesc chunk = {};
+      tickStart                 = HAP_perf_get_qtimer_count();
+      const bool readDesc       = readExact(request, &chunk, sizeof(chunk));
+      freadTicks += HAP_perf_get_qtimer_count() - tickStart;
+      if (!readDesc || chunk.offset > descs[i].logicalSize || chunk.size > descs[i].logicalSize - chunk.offset) {
+        fclose(request);
+        return 8;
+      }
+      tickStart           = HAP_perf_get_qtimer_count();
+      const bool readData = readExact(request, (uint8_t *) ptrs[i] + chunk.offset, chunk.size);
+      freadTicks += HAP_perf_get_qtimer_count() - tickStart;
+      if (!readData) {
+        fclose(request);
+        return 8;
+      }
+      storedBytes += chunk.size;
+      ++chunkCount;
+    }
+    if ((descs[i].flags & kOfflineRpcBufferOutput) &&
+        (header.reserved[kOfflineRpcOutputFdIndex] == 0 ||
+         descs[i].id == (int32_t) header.reserved[kOfflineRpcOutputFdIndex])) {
+      outputIndex = i;
+    }
+  }
+  printf(
+    "offline_rpc_load: complete logical_bytes=%llu stored_bytes=%llu chunks=%llu memalign_ticks=%llu "
+    "memset_ticks=%llu fread_ticks=%llu\n",
+    (unsigned long long) logicalBytes, (unsigned long long) storedBytes, (unsigned long long) chunkCount,
+    (unsigned long long) memalignTicks, (unsigned long long) memsetTicks, (unsigned long long) freadTicks);
+  fflush(stdout);
+  fclose(request);
+  if (outputIndex < 0) {
+    for (uint32_t i = 0; i < header.bufferCount; ++i) {
+      free(ptrs[i]);
+    }
+    for (uint32_t i = 0; i < header.commandCount; ++i) {
+      free(commands[i]);
+    }
+    return 9;
+  }
+  const uint32_t outputOffset = header.reserved[kOfflineRpcOutputOffsetIndex];
+  uint32_t       outputBytes  = header.reserved[kOfflineRpcOutputSizeIndex];
+  if (outputBytes == 0) {
+    outputBytes = descs[outputIndex].logicalSize;
+  }
+  if (outputOffset > descs[outputIndex].logicalSize || outputBytes > descs[outputIndex].logicalSize - outputOffset) {
     return 9;
   }
 
-  // MatMul tensors use NC64 packing. Only the first 32 lanes are logical data.
-  memset(activation, 0, activationBytes);
-  memset(output, 0, outputBytes);
-  for (int row = 0; row < kSize; ++row) {
-    for (int col = 0; col < kSize; ++col) {
-      activation[row * 64 + col] = (__fp16) 1.0f;
+  uint64     totalCycles      = 0;
+  uint64     totalTicks       = 0;
+  int        err              = 0;
+  const bool verifyMockMatMul = header.reserved[0] == kOfflineRpcVerifyMockMatMul;
+  const int  runCount         = verifyMockMatMul ? kMeasuredRuns : 1;
+  for (int run = 0; run < runCount; ++run) {
+    if (verifyMockMatMul) {
+      memset((uint8_t *) ptrs[outputIndex] + outputOffset, 0, outputBytes);
     }
-  }
-  memset(weight, 0x99, weightBytes);  // Each signed q4 value is 1.
-  for (int i = 0; i < kSize; ++i) {
-    scale[i] = (__fp16) 1.0f;
-    bias[i]  = (__fp16) 0.0f;
-  }
-
-  int err = vtcm_manager_acquire();
-  printf("vtcm_manager_acquire: err=%d\n", err);
-  if (err != AEE_SUCCESS) {
-    free(output);
-    free(bias);
-    free(scale);
-    free(weight);
-    free(activation);
-    return 10;
-  }
-
-  // Warm up DMA setup, VTCM paths, and the scalar HMX mock once.
-  err = hmx_matmulq4fp16_mle32((uint8_t *) output, (const uint8_t *) activation, weight, (const uint8_t *) scale,
-                               (const uint8_t *) bias, kSize, kSize, kSize, 1, 1, 1, 1, 0);
-  if (err != AEE_SUCCESS) {
-    vtcm_manager_release();
-    free(output);
-    free(bias);
-    free(scale);
-    free(weight);
-    free(activation);
-    return 11;
-  }
-
-  uint64 totalCycles = 0;
-  uint64 totalTicks  = 0;
-  for (int run = 0; run < kMeasuredRuns; ++run) {
-    memset(output, 0, outputBytes);
-    const uint64 tickStart  = HAP_perf_get_qtimer_count();
-    const uint64 cycleStart = HAP_perf_get_pcycles();
-    err = hmx_matmulq4fp16_mle32((uint8_t *) output, (const uint8_t *) activation, weight, (const uint8_t *) scale,
-                                 (const uint8_t *) bias, kSize, kSize, kSize, 1, 1, 1, 1, 0);
+    uint64 tickStart  = HAP_perf_get_qtimer_count();
+    uint64 cycleStart = HAP_perf_get_pcycles();
+    for (uint32_t commandIndex = 0; commandIndex < header.commandCount && err == 0; ++commandIndex) {
+      err = htp_ops_execute_offline_command(commands[commandIndex], ids, ptrs, header.bufferCount);
+      if (err != 0 || (commandIndex + 1) % 64 == 0 || commandIndex + 1 == header.commandCount) {
+        printf("offline_rpc_execute: command=%lu/%lu err=%d\n", (unsigned long) (commandIndex + 1),
+               (unsigned long) header.commandCount, err);
+        fflush(stdout);
+      }
+    }
     totalCycles += HAP_perf_get_pcycles() - cycleStart;
     totalTicks += HAP_perf_get_qtimer_count() - tickStart;
-    if (err != AEE_SUCCESS) {
+    if (err != 0) {
       break;
     }
   }
-
-  int bad = 0;
-  if (err == AEE_SUCCESS) {
-    for (int row = 0; row < kSize; ++row) {
+  uint16 *output = (uint16 *) ((uint8_t *) ptrs[outputIndex] + outputOffset);
+  int     bad    = 0;
+  if (verifyMockMatMul) {
+    for (int row = 0; err == 0 && row < kSize; ++row) {
       for (int col = 0; col < kSize; ++col) {
-        uint16 bits = 0;
-        __builtin_memcpy(&bits, &output[row * 64 + col], sizeof(bits));
-        if (bits != 0x5000) {  // FP16 32.0
+        if (output[row * 64 + col] != 0x5000) {
           ++bad;
         }
       }
     }
   }
-
-  gBadResults    = bad;
-  gFirstResult   = ((uint16 *) output)[0];
-  gAverageCycles = totalCycles / kMeasuredRuns;
-  gAverageTicks  = totalTicks / kMeasuredRuns;
-
-  vtcm_manager_release();
-  free(output);
-  free(bias);
-  free(scale);
-  free(weight);
-  free(activation);
-  if (err != AEE_SUCCESS) {
-    return 12;
+  gBadResults                             = bad;
+  gFirstResult                            = output[0];
+  gAverageCycles                          = totalCycles / runCount;
+  gAverageTicks                           = totalTicks / runCount;
+  OfflineRpcResponseHeader responseHeader = {
+    kOfflineRpcResponseMagic, kOfflineRpcVersion, err, outputBytes, (uint32_t) bad, output[0],
+    gAverageCycles,           gAverageTicks
+  };
+  FILE *response = fopen("offline_rpc_response.bin", "wb");
+  bool  wrote    = response && writeExact(response, &responseHeader, sizeof(responseHeader)) &&
+               writeExact(response, output, outputBytes);
+  if (response) {
+    fclose(response);
   }
-  return bad == 0 ? 0 : 13;
+  for (uint32_t i = 0; i < header.bufferCount; ++i) {
+    free(ptrs[i]);
+  }
+  for (uint32_t i = 0; i < header.commandCount; ++i) {
+    free(commands[i]);
+  }
+  printf("offline_rpc_graph: err=%d buffers=%lu commands=%lu bad=%d first=0x%04lx\n", err,
+         (unsigned long) header.bufferCount, (unsigned long) header.commandCount, bad, (unsigned long) gFirstResult);
+  return wrote && err == 0 && bad == 0 ? 0 : 10;
 }
 
 int main(int argc, char **argv) {
@@ -154,9 +242,8 @@ int main(int argc, char **argv) {
     return 3;
   }
 
-  const int benchmarkErr = runMockMatMulBenchmark();
-  printf("mock_matmul: err=%d bad=%d first=0x%04lx\n", benchmarkErr, gBadResults, (unsigned long) gFirstResult);
-  printf("mock_matmul average: pcycles=%llu qtimer_ticks=%llu time_ns=%llu\n", (unsigned long long) gAverageCycles,
+  const int benchmarkErr = runOfflineCommand();
+  printf("offline_rpc timing: pcycles=%llu qtimer_ticks=%llu time_ns=%llu\n", (unsigned long long) gAverageCycles,
          (unsigned long long) gAverageTicks, (unsigned long long) (gAverageTicks * 625 / 12));
 
   const AEEResult closeErr = htp_ops_close(handle);

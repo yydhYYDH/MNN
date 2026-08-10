@@ -694,6 +694,18 @@ int htp_execute_command(MmapManager* mmap_manager, const DSPCOMMAND::Command* co
                                               im2colParams);
             break;
         }
+#ifdef SIMULATOR_MOCK_HMX
+        case DSP_OP_VISION_ATTENTION_FP16: {
+            ret = htp_ops_vision_attention_fp16(mapped_ptrs[inputs->size()],
+                                                mapped_ptrs[0],
+                                                mapped_ptrs[1],
+                                                mapped_ptrs[2],
+                                                inputs->size() > 3 ? mapped_ptrs[3] : nullptr,
+                                                intParams[0], intParams[1], intParams[2], intParams[3],
+                                                floatParams[4], intParams[5]);
+            break;
+        }
+#endif
         case DSP_OP_GET_INFO: {
             ret = htp_ops_getInfo_impl(mapped_ptrs[0]);
             break;
@@ -712,6 +724,31 @@ int htp_execute_command(MmapManager* mmap_manager, const DSPCOMMAND::Command* co
 
     return ret;
 }
+
+#ifdef SIMULATOR_MOCK_HMX
+int htp_ops_execute_offline_command(const uint8_t* commandData, const int* bufferIds, void* const* bufferPtrs,
+                                    int bufferCount) {
+    if (commandData == nullptr || bufferIds == nullptr || bufferPtrs == nullptr || bufferCount <= 0) {
+        return AEE_EBADPARM;
+    }
+    MmapManager* manager = mmap_manager_init_local();
+    if (manager == nullptr) {
+        return AEE_ENOMEMORY;
+    }
+    int result = AEE_SUCCESS;
+    for (int i = 0; i < bufferCount; ++i) {
+        if (mmap_manager_register_local(manager, bufferIds[i], bufferPtrs[i]) != 0) {
+            result = AEE_EBADPARM;
+            break;
+        }
+    }
+    if (result == AEE_SUCCESS) {
+        result = htp_execute_command(manager, flatbuffers::GetRoot<DSPCOMMAND::Command>(commandData));
+    }
+    mmap_manager_destroy_local(manager);
+    return result;
+}
+#endif
 
 static int execute_single_command(MmapManager* mmap_manager, int32 cmdFd, int32 cmdOffset, int32 cmdSize, int32 dirty, int* profile = nullptr) {
     void* cmd_base = NULL;

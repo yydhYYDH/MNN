@@ -9,6 +9,7 @@
 #include "core/BufferAllocator.hpp"
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 namespace MNN {
 // Owns the dlopen handle of the host-side DSP library (libMNN_htpops.so) and
@@ -34,7 +35,7 @@ struct HexagonInfo {
     int HP = 0;
     int vtcmSize = 0;
     int maxThreads = 0;
-    float flops[6];// 32, 64, 128, 256, 512, 1024
+    float flops[6]; // 32, 64, 128, 256, 512, 1024
     int hvxArch = 0;
 };
 class HexagonRuntime : public Runtime {
@@ -50,17 +51,15 @@ public:
     virtual void onConcurrencyBegin() const override;
     virtual void onConcurrencyEnd() const override;
     friend class HexagonBackend;
-    const HexagonInfo& info() const {
-        return mInfo;
-    }
-    bool isAvailable() const {
-        return mAvailable;
-    }
+    const HexagonInfo& info() const { return mInfo; }
+    bool isAvailable() const { return mAvailable; }
     static const HexagonFunctions* getDstFunctions();
 #ifdef MNN_HEXAGON_ASAN
-    static std::shared_ptr<BufferAllocator> asanWrapAllocator(std::shared_ptr<BufferAllocator> allocator, const char* tag);
+    static std::shared_ptr<BufferAllocator> asanWrapAllocator(std::shared_ptr<BufferAllocator> allocator,
+                                                              const char* tag);
     static size_t asanPreciseGuardSize();
-    static void asanRegisterRange(const void* owner, const MemChunk& chunk, size_t requestedSize, size_t guardSize, const char* tag);
+    static void asanRegisterRange(const void* owner, const MemChunk& chunk, size_t requestedSize, size_t guardSize,
+                                  const char* tag);
     static void asanUnregisterRange(const void* owner, const MemChunk& chunk);
     static void asanClearRanges(const void* owner);
 #endif
@@ -105,6 +104,21 @@ private:
     mutable std::vector<SyncTensorRecord> mPendingHostInputs;
     mutable std::vector<SyncTensorRecord> mPendingHostOutputs;
     mutable std::vector<SyncTensorRecord> mPendingHexagonOutputs;
+#ifdef MNN_HEXAGON_OFFLINE_RPC
+    struct OfflineRecordedBuffer {
+        int fd = -1;
+        uint32_t alignment = 2048;
+        uint32_t flags = 0;
+        std::vector<uint8_t> data;
+    };
+    mutable std::string mOfflineRecordPath;
+    mutable uint32_t mOfflineOutputFd = 0;
+    mutable uint32_t mOfflineOutputOffset = 0;
+    mutable uint32_t mOfflineOutputSize = 0;
+    mutable bool mOfflineFinalized = false;
+    mutable std::vector<std::vector<uint8_t>> mOfflineRecordedCommands;
+    mutable std::vector<OfflineRecordedBuffer> mOfflineRecordedBuffers;
+#endif
 #ifdef MNN_GPU_TIME_PROFILE
     mutable MemChunk mProfileChunk;
     mutable int mProfileFlushCount = 0;
