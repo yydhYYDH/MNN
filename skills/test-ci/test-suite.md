@@ -65,6 +65,14 @@ Valid filters: `all` (default) · `cpu` · `opencl` · `opencl-image` ·
   Write results on the device, then poll the process and result-file size
   before deciding whether the test completed.
 
+## Simulator / mock build-flag isolation
+
+When a backend adds a simulator-only transport, mock kernel, or test operator behind a build flag, validate both flag
+states in separate build directories. A passing mock smoke test proves only the enabled path. The disabled production
+configuration must also build every affected host and device artifact, and its compile commands plus `nm` / `strings`
+output must not contain the test macro, mock entry points, or test-only diagnostics. This catches partially guarded
+dispatch code that compiles successfully but still changes production behavior or binary size.
+
 ## Environment variables
 
 | Var | Mode | Meaning |
