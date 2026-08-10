@@ -73,6 +73,8 @@ Available endpoints:
 - `POST /v1/chat/completions`
 - `POST /chat/completions` (alias)
 
+`/v1/chat/completions` accepts OpenAI text content and `image_url` content blocks with `data:image/...;base64,...` URLs. Base64 images are decoded to temporary files and forwarded to MNN as `<img>...</img>` prompt tags.
+
 Minimal `curl` examples:
 
 ```bash

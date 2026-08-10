@@ -5,9 +5,25 @@
 
 #include "mnncli_server.hpp"
 #include "log_utils.hpp"
+#include <algorithm>
+#include <cctype>
+#include <cstdint>
+#include <fstream>
 #include <iostream>
+#include <sstream>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <vector>
 
 namespace mnncli {
+
+struct ParsedMessages {
+  std::vector<PromptItem> prompts;
+  bool has_multimodal{false};
+  size_t image_count{0};
+  bool ok{true};
+  std::string error;
+};
 
 std::string GetCurrentTimeAsString() {
   // Get the current time since epoch
@@ -19,20 +35,219 @@ std::string GetCurrentTimeAsString() {
   return std::to_string(seconds);
 }
 
-bool FromJson(const json& j, PromptItem& item) {
-  if (!j.is_object()) {
-    return false;
-  }
-  if (!j.contains("role") || !j["role"].is_string()) {
-    return false;
-  }
-  if (!j.contains("content") || !j["content"].is_string()) {
-    return false;
-  }
+std::string GetCurrentTimeNanosAsString() {
+  auto now = std::chrono::system_clock::now();
+  auto duration = now.time_since_epoch();
+  auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
+  return std::to_string(nanos);
+}
 
-  item.first = j["role"].get<std::string>();   // Role
-  item.second = j["content"].get<std::string>(); // Content
-  return true;
+int Base64Value(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') {
+        return c - 'A';
+    }
+    if (c >= 'a' && c <= 'z') {
+        return c - 'a' + 26;
+    }
+    if (c >= '0' && c <= '9') {
+        return c - '0' + 52;
+    }
+    if (c == '+') {
+        return 62;
+    }
+    if (c == '/') {
+        return 63;
+    }
+    return -1;
+}
+
+bool DecodeBase64(const std::string& input, std::vector<uint8_t>& output) {
+    output.clear();
+    int val = 0;
+    int valb = -8;
+    for (unsigned char c : input) {
+        if (std::isspace(c)) {
+            continue;
+        }
+        if (c == '=') {
+            break;
+        }
+        int decoded = Base64Value(c);
+        if (decoded < 0) {
+            return false;
+        }
+        val = (val << 6) + decoded;
+        valb += 6;
+        if (valb >= 0) {
+            output.push_back(static_cast<uint8_t>((val >> valb) & 0xFF));
+            valb -= 8;
+        }
+    }
+    return !output.empty();
+}
+
+bool ExtractDataUrlBase64(const std::string& url, std::string& base64_data) {
+    const std::string marker = ";base64,";
+    size_t marker_pos = url.find(marker);
+    if (marker_pos == std::string::npos) {
+        return false;
+    }
+    base64_data = url.substr(marker_pos + marker.size());
+    return !base64_data.empty();
+}
+
+std::string SanitizePathPart(const std::string& value) {
+    std::string out;
+    for (char c : value) {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+            out.push_back(c);
+        }
+    }
+    return out.empty() ? "image" : out;
+}
+
+bool EnsureDirectory(const std::string& path) {
+    struct stat st {};
+    if (stat(path.c_str(), &st) == 0) {
+        return S_ISDIR(st.st_mode);
+    }
+    return mkdir(path.c_str(), 0755) == 0;
+}
+
+bool WriteFile(const std::string& path, const std::vector<uint8_t>& data) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out.good()) {
+        return false;
+    }
+    out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+    return out.good();
+}
+
+std::string SaveImageUrlToTempFile(const std::string& url, size_t image_index, std::string& error) {
+    std::string base64_data;
+    if (!ExtractDataUrlBase64(url, base64_data)) {
+        error = "Only data:image/...;base64 image_url is supported.";
+        return "";
+    }
+    std::vector<uint8_t> image_bytes;
+    if (!DecodeBase64(base64_data, image_bytes)) {
+        error = "Failed to decode base64 image_url.";
+        return "";
+    }
+    std::string dir = "/tmp/mnncli_openai_images";
+    if (!EnsureDirectory(dir)) {
+        error = "Failed to create image cache directory: " + dir;
+        return "";
+    }
+    std::string extension = "jpg";
+    if (url.rfind("data:image/", 0) == 0) {
+        size_t start = std::string("data:image/").size();
+        size_t end = url.find(';', start);
+        if (end != std::string::npos && end > start) {
+            extension = SanitizePathPart(url.substr(start, end - start));
+            if (extension == "jpeg") {
+                extension = "jpg";
+            }
+        }
+    }
+    std::ostringstream path;
+    path << dir << "/img_" << GetCurrentTimeNanosAsString() << "_" << image_index << "." << extension;
+    if (!WriteFile(path.str(), image_bytes)) {
+        error = "Failed to write decoded image to: " + path.str();
+        return "";
+    }
+    return path.str();
+}
+
+std::string EscapeForPromptTag(const std::string& text) {
+    std::string escaped;
+    escaped.reserve(text.size());
+    for (char c : text) {
+        if (c == '<' || c == '>') {
+            continue;
+        }
+        escaped.push_back(c);
+    }
+    return escaped;
+}
+
+bool ParseOpenAiContent(const json& content,
+                        std::string& text,
+                        bool& has_multimodal,
+                        size_t& image_count,
+                        std::string& error) {
+    if (content.is_string()) {
+        text = content.get<std::string>();
+        return true;
+    }
+    if (!content.is_array()) {
+        error = "messages[].content must be a string or OpenAI content array.";
+        return false;
+    }
+
+    for (const auto& block : content) {
+        if (!block.is_object()) {
+            continue;
+        }
+        std::string type = block.value("type", std::string());
+        if (type == "text") {
+            if (block.contains("text") && block["text"].is_string()) {
+                if (!text.empty()) {
+                    text += "\n";
+                }
+                text += block["text"].get<std::string>();
+            }
+        } else if (type == "image_url") {
+            if (!block.contains("image_url") || !block["image_url"].is_object() ||
+                !block["image_url"].contains("url") || !block["image_url"]["url"].is_string()) {
+                error = "image_url content block is missing image_url.url.";
+                return false;
+            }
+            std::string url = block["image_url"]["url"].get<std::string>();
+            std::string image_error;
+            std::string image_path = SaveImageUrlToTempFile(url, image_count, image_error);
+            if (image_path.empty()) {
+                error = image_error;
+                return false;
+            }
+            image_count++;
+            if (!text.empty()) {
+                text += "\n";
+            }
+            text += "<img>" + EscapeForPromptTag(image_path) + "</img>";
+            has_multimodal = true;
+        }
+    }
+    return true;
+}
+
+ParsedMessages ParseOpenAiMessages(const json& messages) {
+    ParsedMessages parsed;
+    if (!messages.is_array()) {
+        parsed.ok = false;
+        parsed.error = "messages must be an array.";
+        return parsed;
+    }
+    for (const auto& item_json : messages) {
+        if (!item_json.is_object() || !item_json.contains("role") || !item_json["role"].is_string()) {
+            parsed.ok = false;
+            parsed.error = "Each message must include a string role.";
+            return parsed;
+        }
+        if (!item_json.contains("content")) {
+            parsed.ok = false;
+            parsed.error = "Each message must include content.";
+            return parsed;
+        }
+        std::string content_text;
+        if (!ParseOpenAiContent(item_json["content"], content_text, parsed.has_multimodal,
+                                parsed.image_count, parsed.error)) {
+            parsed.ok = false;
+            return parsed;
+        }
+        parsed.prompts.emplace_back(item_json["role"].get<std::string>(), content_text);
+    }
+    return parsed;
 }
 
 std::string trimLeadingWhitespace(const std::string& str) {
@@ -150,17 +365,21 @@ std::string GetR1UserString(std::string user_content, bool last) {
     return result_prompts;
 }
 
+void RunLlmResponse(MNN::Transformer::Llm* llm,
+                    bool is_r1,
+                    const ParsedMessages& parsed,
+                    std::ostream& output_ostream,
+                    const char* end_with) {
+    auto prompts = is_r1 ? ConvertToR1(parsed.prompts) : parsed.prompts;
+    llm->response(prompts, &output_ostream, end_with);
+}
+
 void MnncliServer::Answer(MNN::Transformer::Llm* llm, const json &messages, std::function<void(const std::string&)> on_result) {
-  std::vector<PromptItem> prompts{};
-  if (messages.is_array()) {
-    for (const auto& item_json : messages) {
-      PromptItem item;
-      if (!FromJson(item_json, item)) {
-        LOG_DEBUG("Error converting JSON object to PromptItem.");
-        break;
-      }
-      prompts.push_back(item);
-    }
+  ParsedMessages parsed = ParseOpenAiMessages(messages);
+  if (!parsed.ok) {
+    LOG_DEBUG("Error parsing OpenAI messages: " + parsed.error);
+    on_result("error: " + parsed.error);
+    return;
   }
   std::stringstream response_buffer;
   Utf8StreamProcessor processor([&response_buffer, on_result](const std::string& utf8Char) {
@@ -177,22 +396,18 @@ void MnncliServer::Answer(MNN::Transformer::Llm* llm, const json &messages, std:
     processor.processStream(str, len);
   }};
   std::ostream output_ostream(&stream_buffer);std::lock_guard<std::mutex> lock(llm_mutex_);
-  llm->response(this->is_r1_ ? ConvertToR1(prompts) : prompts, &output_ostream, "<eop>");
+  RunLlmResponse(llm, this->is_r1_, parsed, output_ostream, "<eop>");
 }
 
 void MnncliServer::AnswerStreaming(MNN::Transformer::Llm* llm,
                      const json& messages,
                      std::function<void(const std::string&, bool end)> on_partial) {
-    std::vector<PromptItem> prompts;
-    if (messages.is_array()) {
-        for (const auto& item_json : messages) {
-            PromptItem item;
-            if (!FromJson(item_json, item)) {
-                LOG_DEBUG("Error converting JSON object to PromptItem.");
-                return;
-            }
-            prompts.push_back(item);
-        }
+    ParsedMessages parsed = ParseOpenAiMessages(messages);
+    if (!parsed.ok) {
+        LOG_DEBUG("Error parsing OpenAI messages: " + parsed.error);
+        on_partial("error: " + parsed.error, false);
+        on_partial("", true);
+        return;
     }
     std::string answer = "";
     Utf8StreamProcessor processor([&on_partial, &answer](const std::string &utf8Char) {
@@ -213,7 +428,7 @@ void MnncliServer::AnswerStreaming(MNN::Transformer::Llm* llm,
     });
     std::ostream output_ostream(&stream_buffer);
     std::lock_guard<std::mutex> lock(llm_mutex_);
-    llm->response(this->is_r1_ ? ConvertToR1(prompts) : prompts, &output_ostream, "<eop>");
+    RunLlmResponse(llm, this->is_r1_, parsed, output_ostream, "<eop>");
 }
 
 
@@ -224,7 +439,11 @@ void AllowCors(httplib::Response& res) {
     res.set_header("Access-Control-Allow-Headers",  "Content-Type, Authorization");
 }
 
-void MnncliServer::Start(MNN::Transformer::Llm* llm, bool is_r1, const std::string& host, int port) {
+void MnncliServer::Start(MNN::Transformer::Llm* llm,
+                         bool is_r1,
+                         const std::string& host,
+                         int port,
+                         const std::string& model_id) {
     this->is_r1_ = is_r1;
     // Create a server instance
     httplib::Server server;
@@ -248,7 +467,7 @@ void MnncliServer::Start(MNN::Transformer::Llm* llm, bool is_r1, const std::stri
         {"object", "list"},
         {"data", json::array({
           {
-            {"id", "ModelScope/MNN/Qwen2.5-0.5B-Instruct"},
+            {"id", model_id},
             {"object", "model"},
             {"created", static_cast<int>(time(nullptr))},
             {"owned_by", "mnn"}

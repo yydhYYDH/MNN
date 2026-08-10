@@ -142,7 +142,7 @@ int ServeCommandHandler::Handle(const ParsedCommand& cmd) {
 
     // Start HTTP server (blocking call)
     MnncliServer server;
-    server.Start(llm.get(), is_r1, host, port);
+    server.Start(llm.get(), is_r1, host, port, model_name);
 
     return 0;
 }
