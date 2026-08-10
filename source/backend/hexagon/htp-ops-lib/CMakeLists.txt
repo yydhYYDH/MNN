@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.14.3)
 project(htp_ops C CXX ASM)
 # cmake_policy(SET CMP0115 OLD)
 
+option(HTP_OPS_SIMULATOR_MOCK_HMX "Use scalar HMX mock for Hexagon simulator" OFF)
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(MNN_HTP_OPS_STUB_NAME MNN_htpops)
@@ -97,6 +99,10 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/ops/pool_fp16.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/ops/depthwise_conv_fp16.c
     )
+    if(HTP_OPS_SIMULATOR_MOCK_HMX)
+        target_compile_definitions(htp_ops_skel PRIVATE SIMULATOR_MOCK_HMX=1)
+    endif()
+    message(STATUS "Hexagon HMX simulator mock: ${HTP_OPS_SIMULATOR_MOCK_HMX}")
     set_target_properties(htp_ops_skel PROPERTIES OUTPUT_NAME ${MNN_HTP_OPS_SKEL_NAME})
     build_idl(include/htp_ops.idl htp_ops_skel)
     set(HTP_OPS_PWL_VARIANT "learned8" CACHE STRING
