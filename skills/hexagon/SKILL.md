@@ -53,6 +53,22 @@ Run commands from the directories expected by the project scripts.
   - `cp source/backend/hexagon/htp-ops-lib/outputs/libMNN_htpops.so project/android/build_64/libMNN_htpops.so`
   - `cp source/backend/hexagon/htp-ops-lib/outputs/libMNN_htpops_skel.so project/android/build_64/libMNN_htpops_skel.so`
 
+## Android FastRPC Library Paths
+
+- Deploy both sides of MNN's FastRPC pair: host `libMNN_htpops.so` and cDSP `libMNN_htpops_skel.so` (or the selected
+  `libMNN_htpops_skelV*.so`). QNN's `libQnnHtpV*Stub.so` and `libQnnHtpV*Skel.so` are not dependencies of this backend.
+- On a non-root Android shell such as Termux, preserve this library order (replace `BUNDLE` with the deployment path):
+  - `export LD_LIBRARY_PATH=/system/lib64:/vendor/lib64:/system/vendor/lib64:$BUNDLE`
+  - `export ADSP_LIBRARY_PATH="$BUNDLE;/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp"`
+- The order is required: FastRPC must resolve to the device's `/vendor/lib64/libcdsprpc.so`, while common Android
+  libraries resolve from `/system/lib64` first. Do not let an SDK/QAIRT `libcdsprpc.so` in the bundle shadow the device
+  implementation; `remote_session_control` may be a stub and fail. Do not put `/vendor/lib64` before `/system/lib64`,
+  because vendor Binder libraries may then override incompatible system libraries.
+- Before running a model, verify the host dependency resolution with Android's linker when `ldd` is unavailable:
+  - `/system/bin/linker64 --list $BUNDLE/libMNN_htpops.so`
+- Require runtime evidence that the selected skel opened and the DSP information query succeeded. A process exit code
+  alone is insufficient if the log reports `Error: can't load module` or the profile reports zero commands.
+
 ## Profile And Crash Checks
 
 - Clear logs before a run when checking failures:
@@ -100,6 +116,18 @@ Run commands from the directories expected by the project scripts.
   SONAME and copy required DSP C++ runtimes (`libc++.so.1` and `libc++abi.so.1`) into that directory.
 - Do not trust a piped simulator command's shell status alone. Require the runner's correctness marker and
   `Main() returned 0` in the captured log.
+
+## Simulator And Device Numerical Triage
+
+- Compare simulator, device, and CPU with the same extracted graph, input bytes, tensor layout, and output boundary.
+  Separately report simulator-versus-device, simulator-versus-CPU, and device-versus-CPU metrics. If the first is
+  small while the other two are similar, the evidence points to a shared backend precision effect rather than an ISS
+  model mismatch.
+- Bisect cumulative graphs at meaningful boundaries, then rerun the suspected kernel with an identical saved input on
+  CPU and Hexagon. This separates a kernel's same-input error from amplification of an upstream activation difference.
+- For deep FP16 graphs, preserve max error but also report RMS/NRMSE, cosine similarity, non-finite count, and repeat
+  determinism. Define acceptance thresholds before judging the result; do not silently weaken a failing FP32-oriented
+  max-error check.
 
 ## DSP DMA-BUF Memory Measurement
 
