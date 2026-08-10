@@ -50,15 +50,29 @@ static int roundHalfToEven(float value) {
 }
 
 static std::pair<int, int> qwenVlSmartResize(int height, int width, int factor, int minPixels, int maxPixels) {
+    if (factor <= 0 || height < factor || width < factor) {
+        MNN_ERROR("Qwen-VL smart resize requires height and width >= factor, got %dx%d with factor %d\n", height, width,
+                  factor);
+        return std::make_pair(0, 0);
+    }
+    if (minPixels <= 0 || maxPixels < minPixels) {
+        MNN_ERROR("Qwen-VL smart resize got invalid pixel limits: min=%d, max=%d\n", minPixels, maxPixels);
+        return std::make_pair(0, 0);
+    }
+    const double aspectRatio = static_cast<double>(std::max(height, width)) / std::min(height, width);
+    if (aspectRatio > 200.0) {
+        MNN_ERROR("Qwen-VL smart resize requires an aspect ratio no larger than 200, got %.2f\n", aspectRatio);
+        return std::make_pair(0, 0);
+    }
     int resizedHeight = roundHalfToEven(static_cast<float>(height) / factor) * factor;
     int resizedWidth = roundHalfToEven(static_cast<float>(width) / factor) * factor;
     int64_t resizedPixels = static_cast<int64_t>(resizedHeight) * resizedWidth;
     if (resizedPixels > maxPixels) {
-        float beta = std::sqrt(static_cast<float>(height) * width / maxPixels);
-        resizedHeight = static_cast<int>(std::floor(height / beta / factor)) * factor;
-        resizedWidth = static_cast<int>(std::floor(width / beta / factor)) * factor;
+        double beta = std::sqrt(static_cast<double>(height) * width / maxPixels);
+        resizedHeight = std::max(factor, static_cast<int>(std::floor(height / beta / factor)) * factor);
+        resizedWidth = std::max(factor, static_cast<int>(std::floor(width / beta / factor)) * factor);
     } else if (resizedPixels < minPixels) {
-        float beta = std::sqrt(static_cast<float>(minPixels) / (static_cast<float>(height) * width));
+        double beta = std::sqrt(static_cast<double>(minPixels) / (static_cast<double>(height) * width));
         resizedHeight = static_cast<int>(std::ceil(height * beta / factor)) * factor;
         resizedWidth = static_cast<int>(std::ceil(width * beta / factor)) * factor;
     }
@@ -86,6 +100,10 @@ struct PillowResizeCoeffs {
     std::vector<int> bounds;
     std::vector<int> weights;
 };
+
+static inline int pillowQuantizeCoeff(double value) {
+    return static_cast<int>(value < 0.0 ? value - 0.5 : value + 0.5);
+}
 
 static PillowResizeCoeffs precomputePillowResizeCoeffs(int inSize, int outSize) {
     const double filterSupport = 2.0;
@@ -120,7 +138,7 @@ static PillowResizeCoeffs precomputePillowResizeCoeffs(int inSize, int outSize) 
             }
         }
         for (int x = 0; x < xmax; ++x) {
-            coeffs.weights[xx * ksize + x] = static_cast<int>(floatWeights[x] * kPillowResizePrecision);
+            coeffs.weights[xx * ksize + x] = pillowQuantizeCoeff(floatWeights[x] * kPillowResizePrecision);
         }
         for (int x = xmax; x < ksize; ++x) {
             coeffs.weights[xx * ksize + x] = 0;
@@ -532,6 +550,9 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
     const int minPixels = mConfig->config_.value("image_min_pixels", defaultMinPixels);
     const int maxPixels = mConfig->config_.value("image_max_pixels", defaultMaxPixels);
     auto resizedSize = qwenVlSmartResize(mVisionHeight, mVisionWidth, align_size, minPixels, maxPixels);
+    if (resizedSize.first == 0 || resizedSize.second == 0) {
+        return {};
+    }
     mVisionHeight = resizedSize.first;
     mVisionWidth = resizedSize.second;
     bool usePillowResize = isQwen3VL && mConfig->config_.value("qwen3_vl_pillow_resize", true);
@@ -541,14 +562,12 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
             image = pillowImage;
         } else {
             MNN_ERROR("qwen3VlPillowResizeAndNormalize failed, fallback to MNN CV resize\n");
-            image = MNN::CV::resize(image, {mVisionWidth, mVisionHeight}, 0, 0,
-                                    MNN::CV::INTER_LINEAR, MNN::CV::COLOR_BGR2RGB,
-                                    mVisionMean, mVisionNorm);
+            image = MNN::CV::resize(image, {mVisionWidth, mVisionHeight}, 0, 0, MNN::CV::INTER_LINEAR,
+                                    MNN::CV::COLOR_BGR2RGB, mVisionMean, mVisionNorm);
         }
     } else {
-        image = MNN::CV::resize(image, {mVisionWidth, mVisionHeight}, 0, 0,
-                                MNN::CV::INTER_LINEAR, MNN::CV::COLOR_BGR2RGB,
-                                mVisionMean, mVisionNorm);
+        image = MNN::CV::resize(image, {mVisionWidth, mVisionHeight}, 0, 0, MNN::CV::INTER_LINEAR,
+                                MNN::CV::COLOR_BGR2RGB, mVisionMean, mVisionNorm);
     }
     image = Express::_Unsqueeze(image, {0});
     image = Express::_Convert(image, NCHW);
