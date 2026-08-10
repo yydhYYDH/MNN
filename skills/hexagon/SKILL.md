@@ -171,7 +171,17 @@ description: MNN Hexagon/HVX/HMX DSP 后端（`source/backend/hexagon`）的优�
 - HMX 路径在加宽 tile 或 block 之前，先核对 VTCM 分配大小、tile 数和 descriptor 数。
 - 不要假设一个微优化能在 v79/v81 之间通用；针对目标架构构建并测试。不通用的原因、以及如何用单台设备验证 arch 假设，见「双架构」。
 
-## DSP DMA-BUF 内存测量
+## QuRT Simulator Checks
+
+- Allocate buffers used by DSP DMA from aligned QuRT heap or mapped memory. Do not use writable sections of a
+  dynamically loaded runner `.so` as DMA input/output storage; the simulator can fault when the CPU accesses those
+  pages after DMA.
+- QuRT's runtime loader searches the simulator working directory for `DT_NEEDED` libraries. Stage the skel under its
+  SONAME and copy required DSP C++ runtimes (`libc++.so.1` and `libc++abi.so.1`) into that directory.
+- Do not trust a piped simulator command's shell status alone. Require the runner's correctness marker and
+  `Main() returned 0` in the captured log.
+
+## DSP DMA-BUF Memory Measurement
 
 用于验证 Hexagon/DSP 内存占用，或对比 CPU 与 `forwardtype=10`。
 
