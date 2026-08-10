@@ -53,6 +53,74 @@ To run the compiled MNN with the Hexagon backend on an Android device:
 
 ```bash
 # Example on device:
-export ADSP_LIBRARY_PATH="/data/local/tmp/hexagon_libs;/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp"
-export LD_LIBRARY_PATH="/data/local/tmp/hexagon_libs:$LD_LIBRARY_PATH"
+BUNDLE=/data/local/tmp/hexagon_libs
+export LD_LIBRARY_PATH="/system/lib64:/vendor/lib64:/system/vendor/lib64:$BUNDLE"
+export ADSP_LIBRARY_PATH="$BUNDLE;/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp"
 ```
+
+The `LD_LIBRARY_PATH` order is significant on Android. MNN's FastRPC stub must use the device implementation at
+`/vendor/lib64/libcdsprpc.so`, while common Android dependencies such as Binder must resolve from `/system/lib64`
+first. Do not put the bundle first when it contains an SDK or QAIRT copy of `libcdsprpc.so`; those SDK libraries may
+only contain stubbed control routines and fail to obtain the effective DSP domain. Putting `/vendor/lib64` before
+`/system/lib64` can instead mix vendor and system Binder ABIs and cause linker errors.
+
+This backend uses MNN's own FastRPC pair, `libMNN_htpops.so` on the Android host and
+`libMNN_htpops_skel.so` (or the architecture-specific `libMNN_htpops_skelV*.so`) on cDSP. It does not use QNN's
+`libQnnHtpV*Stub.so` or `libQnnHtpV*Skel.so`.
+
+### Validate a Vision model
+
+Copy `htp-ops-lib/tests/run_android_visual.sh` into the deployment directory and run it from Termux:
+
+```bash
+cd /path/to/hexagon_bundle
+./run_android_visual.sh /path/to/model /path/to/reference visual-hexagon.log
+```
+
+The reference directory must contain `input.mnn` and `output.mnn`. The script selects backend type 10 for both the
+primary and backup backend, so an unsupported operator cannot silently fall back to CPU. It also requires evidence
+that the architecture-specific skel was opened, the DSP capability query succeeded, all 1084 commands in the tested
+Qwen3-VL Vision graph were submitted, and `VISION_ATTENTION_FP16` was profiled.
+
+`ModuleBasic.out` uses a fixed max-error check of one percent. That check is useful for short FP32 graphs but can be
+too strict for a deep FP16 graph because it ignores error distribution. Preserve its output, then additionally compare
+the generated text tensors against the float32 CPU references:
+
+```bash
+python3 source/backend/hexagon/htp-ops-lib/tests/qurt-simulator/compare_f32.py \
+  visual-output.0.f32 output/0_0.txt --actual-text --min-cosine 0.999 --max-nrmse 0.04
+python3 source/backend/hexagon/htp-ops-lib/tests/qurt-simulator/compare_f32.py \
+  visual-output.1.f32 output/0_1.txt --actual-text --min-cosine 0.999 --max-nrmse 0.04
+```
+
+For the Qwen3-VL-2B FP16 four-token reference used during v79 bring-up, the measured results were:
+
+| Output | Max error | RMS error | NRMSE | Cosine |
+| --- | ---: | ---: | ---: | ---: |
+| `image_embeds` | 0.0773752 | 0.00497166 | 0.0234260 | 0.99983118 |
+| `deepstack_feature` | 0.272133 | 0.0220347 | 0.0331069 | 0.99949445 |
+
+Both repeated runs were bit-identical and contained no NaN or Inf. Always clear and inspect `logcat` around the run;
+a successful process exit alone does not rule out an RPC or cDSP failure.
+
+### Simulator versus v79 device numerics
+
+Use the same extracted graph and non-uniform input for simulator/device comparisons. On the first 52-command Vision
+block, v79 device versus simulator measured max error 0.00390625 and RMS error 0.00018939. Both paths had nearly the
+same difference from the FP32 CPU reference (max error 0.102395 and RMS error about 0.00650). This rules out a large
+v79 ISS-versus-HMX-device discrepancy for that block.
+
+Subgraph bisection showed that Attention, FC1, and FC1+GELU each stayed below 0.0014 RMS, while the complete MLP rose
+to 0.00629 RMS. Feeding the device GELU activation into the CPU FC2 reproduced 0.00625 RMS, whereas running HMX FC2
+and CPU FC2 on the same activation differed by about 0.00102 RMS. The dominant effect is therefore amplification of
+small FP16 intermediate differences by the 4096-to-1024 projection, not a different HMX numerical model on hardware.
+
+To reduce the CPU-reference gap, first improve the upstream FP16 kernels that create those activation differences
+(especially Conv1x1 accumulation/conversion, LayerNorm, and GELU approximation), and validate each change with the
+same subgraph input. Retaining selected intermediates at higher precision would reduce rounding further but changes
+the backend tensor contract and increases memory traffic. Porting Vision Attention from the scalar DSP baseline to
+HVX/HMX is still important for performance, but the bisection above shows it is not the main accuracy issue.
+
+The current production `VISION_ATTENTION_FP16` implementation is that scalar cDSP correctness baseline. It executes
+inside the loaded MNN skel and is not a CPU fallback, but its cost grows quadratically with token count. Treat the
+four-token profile above as bring-up evidence rather than representative full-resolution Vision performance.
