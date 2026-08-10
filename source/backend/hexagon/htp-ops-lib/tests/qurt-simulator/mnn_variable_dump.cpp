@@ -52,6 +52,19 @@ int listVariables(const char *modelPath) {
   return 0;
 }
 
+int renameVariables(const char *inputPath, const char *outputPath, int nameCount, char **names) {
+  auto variables = Variable::load(inputPath);
+  if (variables.size() != static_cast<size_t>(nameCount)) {
+    fprintf(stderr, "Expected %zu names for %s, got %d\n", variables.size(), inputPath, nameCount);
+    return 2;
+  }
+  for (size_t index = 0; index < variables.size(); ++index) {
+    variables[index]->setName(names[index]);
+  }
+  Variable::save(variables, outputPath);
+  return 0;
+}
+
 int listConvolutions(const char *modelPath) {
   const auto variables = Variable::loadMap(modelPath);
   size_t     index     = 0;
@@ -176,11 +189,14 @@ int main(int argc, char **argv) {
   if (argc == 7 && std::string(argv[1]) == "extract-block") {
     return extractVisionBlock(argv[2], argv[3], argv[4], argv[5], atoi(argv[6]));
   }
+  if (argc >= 5 && std::string(argv[1]) == "rename") {
+    return renameVariables(argv[2], argv[3], argc - 4, argv + 4);
+  }
   if (argc != 3) {
     fprintf(stderr,
             "Usage: %s list MODEL.mnn | convs MODEL.mnn | trace MODEL.mnn OUTPUT_NAME DEPTH | extract-conv "
             "MODEL.mnn OUTPUT_NAME OUTPUT.mnn ROWS | extract-block MODEL.mnn INPUT_NAME OUTPUT_NAME OUTPUT.mnn "
-            "ROWS | INPUT.mnn OUTPUT_PREFIX\n",
+            "ROWS | rename INPUT.mnn OUTPUT.mnn NAME... | INPUT.mnn OUTPUT_PREFIX\n",
             argv[0]);
     return 64;
   }
