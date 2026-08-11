@@ -56,6 +56,28 @@ static bool isFullLinearC4Reshape(const Tensor::InsideDescribe::Region& region, 
            computeArea(origin) != computeArea(output);
 }
 
+static bool turnLinearC4ReshapeToRaster(const Tensor::InsideDescribe::Region& slice, const Tensor* output, int pack,
+                                        HexagonRaster::RasterRegion& region) {
+    const Tensor* origin = slice.origin;
+    if (!isFullLinearC4Reshape(slice, output, pack) || origin->batch() != 1 || computeArea(origin) != 1 ||
+        computeArea(output) != 1) {
+        return false;
+    }
+    region.srcIndex = 0;
+    region.srcOffset = 0;
+    region.dstOffset = 0;
+    region.size[0] = output->channel() / pack;
+    region.size[1] = output->batch();
+    region.size[2] = pack;
+    region.srcStride[0] = pack;
+    region.srcStride[1] = output->channel();
+    region.srcStride[2] = 1;
+    region.dstStride[0] = output->batch() * pack;
+    region.dstStride[1] = pack;
+    region.dstStride[2] = 1;
+    return true;
+}
+
 static bool turnArea1ChannelSliceToC4Regions(const Tensor::InsideDescribe::Region& slice, const Tensor* output,
                                              int pack,
                                              std::vector<std::shared_ptr<Tensor::InsideDescribe::Region>>& regions) {
@@ -243,6 +265,23 @@ ErrorCode HexagonRaster::onBuildCmd(const std::vector<Tensor*>& inputs, const st
     }
     mRegionCount = (int)des->regions.size();
     if (mRegionCount == 0) {
+        return NO_ERROR;
+    }
+
+    HexagonRaster::RasterRegion linearC4Region;
+    if (mRegionCount == 1 && turnLinearC4ReshapeToRaster(des->regions[0], output, pack, linearC4Region)) {
+        struct SingleRasterParam {
+            int regionCount;
+            int bytes;
+            int srcNumber;
+            HexagonRaster::RasterRegion region;
+        } __attribute__((packed));
+        SingleRasterParam params = {1, mBytes, 1, linearC4Region};
+        auto* origin = des->regions[0].origin;
+        dst.emplace_back();
+        dst.back().build(hexagonBackend, DSP_OP_RASTER_BLIT, &params, sizeof(params),
+                         {HexagonBackend::getDevicePtr(origin)}, {HexagonBackend::getDevicePtr(output)}, {origin},
+                         {output});
         return NO_ERROR;
     }
 
