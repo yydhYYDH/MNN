@@ -120,11 +120,13 @@ To reduce the CPU-reference gap, first improve the upstream FP16 kernels that cr
 same subgraph input. Retaining selected intermediates at higher precision would reduce rounding further but changes
 the backend tensor contract and increases memory traffic.
 
-The Vision path now uses the dedicated `VISION_FLASH_ATTENTION_FP16` command. It packs Vision K/V into the block-256
-layout consumed by the existing HMX/HVX `sync_attention` kernel and processes queries in blocks of 32. Its workspace
-base and all internal regions must remain 128-byte aligned; aligned offsets from an unaligned DSP `malloc` base can
-produce incorrect HMX results without returning an execution error. Head dimensions that are not multiples of 64
-continue to use the scalar `VISION_ATTENTION_FP16` correctness path.
+The Vision path now uses the dedicated `VISION_FLASH_ATTENTION_FP16` command. It uses the existing worker-pooled HVX
+K/V packer to produce the block-256 layout consumed by the HMX/HVX `sync_attention` kernel, and processes queries in
+blocks of 64. Its workspace is allocated by the host-side MNN dynamic allocator and passed as a second DSP output,
+avoiding a DSP `malloc`/`free` in every Vision layer. The workspace base and all internal regions must remain 128-byte
+aligned; aligned offsets from an unaligned base can produce incorrect HMX results without returning an execution
+error. Head dimensions that are not multiples of 64 continue to use the scalar `VISION_ATTENTION_FP16` correctness
+path.
 
 Vision execution is kept separate from the LLM KV-cache path. It must not update `seq_current`/`seq_add` or add the
 LLM page-table input, even when the runtime exposes a non-null `KVMeta` while the multimodal module is executing.

@@ -77,34 +77,6 @@ static void preprocess_mask_to_fp32(float* restrict dst, const __fp16* restrict 
   }
 }
 
-static void vision_pack_kv(__fp16* packedK, __fp16* packedV, const __fp16* key, const __fp16* value, int tokens,
-                           int heads, int headDim) {
-  const int dimTiles = (headDim + 31) / 32;
-  const size_t tokenStride = (size_t)heads * headDim;
-  for (int token = 0; token < tokens; ++token) {
-    const int seqTile = token / 32;
-    const int seqInner = token % 32;
-    const int seqPair = seqInner / 2;
-    const int seqLane = seqInner % 2;
-    for (int head = 0; head < heads; ++head) {
-      const __fp16* keyHead = key + (size_t)token * tokenStride + head * headDim;
-      const __fp16* valueHead = value + (size_t)token * tokenStride + head * headDim;
-      for (int dimTile = 0; dimTile < dimTiles; ++dimTile) {
-        const int dimBase = dimTile * 32;
-        const int valid = headDim - dimBase < 32 ? headDim - dimBase : 32;
-        __fp16* keyDst = packedK + attn_hmx_k_tile_index(seqTile, head, dimTile, heads, dimTiles) * 1024 +
-                         seqInner * 2;
-        __fp16* valueDst = packedV + attn_hmx_v_tile_index(dimTile, seqTile, head, heads, dimTiles) * 1024 +
-                           seqPair * 64 + seqLane;
-        for (int dim = 0; dim < valid; ++dim) {
-          keyDst[(dim / 2) * 64 + (dim % 2)] = keyHead[dimBase + dim];
-          valueDst[dim * 2] = valueHead[dimBase + dim];
-        }
-      }
-    }
-  }
-}
-
 extern "C" AEEResult htp_ops_vision_flash_attention_fp16(
     uint8_t* pOut, const uint8_t* pQ, const uint8_t* pK, const uint8_t* pV, const uint8_t* pMask,
     uint8_t* pWorkspace, int batch, int tokens, int heads, int headDim, float scale, int maskStride) {
@@ -121,7 +93,7 @@ extern "C" AEEResult htp_ops_vision_flash_attention_fp16(
       (size_t)seqBlocks * heads * vOcP * ATTN_HMX_KV_BLOCK_TILES * 1024 * sizeof(__fp16);
   const int totalTasks = sync_attention_total_tasks(tokens, 0, tokens, heads, heads, headDim, tokens, maskStride);
   const int workerSlots = sync_attention_pick_task_count(totalTasks);
-  const int queryBlock = tokens < 32 ? tokens : 32;
+  const int queryBlock = tokens < 64 ? tokens : 64;
   const size_t workerBytes = sync_attention_head_workspace_bytes(queryBlock, tokens);
 
   size_t packedKOffset = 0;
@@ -137,9 +109,10 @@ extern "C" AEEResult htp_ops_vision_flash_attention_fp16(
   uint8_t* ownedWorkspace = NULL;
   if (pWorkspace == NULL) {
     ownedWorkspace = (uint8_t*)malloc(workspaceBytes + 127);
-    if (ownedWorkspace != NULL) {
-      pWorkspace = (uint8_t*)(((uintptr_t)ownedWorkspace + 127) & ~(uintptr_t)127);
-    }
+    pWorkspace = ownedWorkspace;
+  }
+  if (pWorkspace != NULL) {
+    pWorkspace = (uint8_t*)(((uintptr_t)pWorkspace + 127) & ~(uintptr_t)127);
   }
   if (pWorkspace == NULL) {
     return AEE_ENOMEMORY;
@@ -161,8 +134,12 @@ extern "C" AEEResult htp_ops_vision_flash_attention_fp16(
 
     memset(packedK, 0, packedKBytes);
     memset(packedV, 0, packedVBytes);
-    vision_pack_kv((__fp16*)packedK, (__fp16*)packedV, key, value, tokens, heads, headDim);
-    AEEResult ret = AEE_SUCCESS;
+    AEEResult ret = htp_ops_push_kv(packedK, packedV, (uint8_t*)key, (uint8_t*)value, 0, tokens, heads, headDim,
+                                    seqBlocks * ATTN_HMX_KV_BLOCK, 0, 0, tokens);
+    if (ret != AEE_SUCCESS) {
+      free(ownedWorkspace);
+      return ret;
+    }
     for (int qBase = 0; qBase < tokens; qBase += queryBlock) {
       const int queryRows = tokens - qBase < queryBlock ? tokens - qBase : queryBlock;
       if (mask != NULL) {
