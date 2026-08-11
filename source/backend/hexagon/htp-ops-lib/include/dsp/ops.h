@@ -77,6 +77,9 @@ int htp_ops_conv1x1_direct_fp16(uint8_t *output, uint8_t *input, uint8_t *weight
 int htp_ops_vision_attention_fp16(uint8_t *output, const uint8_t *query, const uint8_t *key, const uint8_t *value,
                                   const uint8_t *mask, int batch, int tokens, int heads, int headDim, float scale,
                                   int maskStride);
+int htp_ops_vision_flash_attention_fp16(uint8_t *output, const uint8_t *query, const uint8_t *key,
+                                        const uint8_t *value, const uint8_t *mask, uint8_t *workspace, int batch,
+                                        int tokens, int heads, int headDim, float scale, int maskStride);
 #if defined(__hexagon__) || defined(__arm__) || defined(__aarch64__)
 int hvx_pool2d_fp16(__fp16 *restrict dst, const __fp16 *restrict src, int batch, int ih, int iw, int oh, int ow, int c4,
                     int kernelY, int kernelX, int strideY, int strideX, int padY, int padX, int padType, int countType,

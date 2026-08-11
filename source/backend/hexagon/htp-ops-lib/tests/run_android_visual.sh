@@ -37,7 +37,7 @@ fi
 grep -q "skel arch verified" "${LOG_FILE}"
 grep -q "vectorSize=.*vtcmSize=.*maxThreads=.*hvxArch=" "${LOG_FILE}"
 grep -q "max commands/group: 1084" "${LOG_FILE}"
-grep -q "DSPOpType VISION_ATTENTION_FP16" "${LOG_FILE}"
+grep -q "DSPOpType VISION_FLASH_ATTENTION_FP16" "${LOG_FILE}"
 if grep -Eq "unsupported op|resize failed|execute_command_group_profile failed|Error in forward|Fatal signal" "${LOG_FILE}"; then
     echo "Hexagon execution failure found in ${LOG_FILE}" >&2
     exit 4

@@ -80,7 +80,7 @@ cd /path/to/hexagon_bundle
 The reference directory must contain `input.mnn` and `output.mnn`. The script selects backend type 10 for both the
 primary and backup backend, so an unsupported operator cannot silently fall back to CPU. It also requires evidence
 that the architecture-specific skel was opened, the DSP capability query succeeded, all 1084 commands in the tested
-Qwen3-VL Vision graph were submitted, and `VISION_ATTENTION_FP16` was profiled.
+Qwen3-VL Vision graph were submitted, and `VISION_FLASH_ATTENTION_FP16` was profiled.
 
 `ModuleBasic.out` uses a fixed max-error check of one percent. That check is useful for short FP32 graphs but can be
 too strict for a deep FP16 graph because it ignores error distribution. Preserve its output, then additionally compare
@@ -118,9 +118,13 @@ small FP16 intermediate differences by the 4096-to-1024 projection, not a differ
 To reduce the CPU-reference gap, first improve the upstream FP16 kernels that create those activation differences
 (especially Conv1x1 accumulation/conversion, LayerNorm, and GELU approximation), and validate each change with the
 same subgraph input. Retaining selected intermediates at higher precision would reduce rounding further but changes
-the backend tensor contract and increases memory traffic. Porting Vision Attention from the scalar DSP baseline to
-HVX/HMX is still important for performance, but the bisection above shows it is not the main accuracy issue.
+the backend tensor contract and increases memory traffic.
 
-The current production `VISION_ATTENTION_FP16` implementation is that scalar cDSP correctness baseline. It executes
-inside the loaded MNN skel and is not a CPU fallback, but its cost grows quadratically with token count. Treat the
-four-token profile above as bring-up evidence rather than representative full-resolution Vision performance.
+The Vision path now uses the dedicated `VISION_FLASH_ATTENTION_FP16` command. It packs Vision K/V into the block-256
+layout consumed by the existing HMX/HVX `sync_attention` kernel and processes queries in blocks of 32. Its workspace
+base and all internal regions must remain 128-byte aligned; aligned offsets from an unaligned DSP `malloc` base can
+produce incorrect HMX results without returning an execution error. Head dimensions that are not multiples of 64
+continue to use the scalar `VISION_ATTENTION_FP16` correctness path.
+
+Vision execution is kept separate from the LLM KV-cache path. It must not update `seq_current`/`seq_add` or add the
+LLM page-table input, even when the runtime exposes a non-null `KVMeta` while the multimodal module is executing.

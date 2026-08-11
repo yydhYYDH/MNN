@@ -169,6 +169,7 @@ void HexagonAttention::updatePageTable() {
 
 ErrorCode HexagonAttention::onBuildCmd(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
                                        std::vector<HexagonCommand>& dst) {
+    mVisionState = false;
 #ifdef MNN_HEXAGON_OFFLINE_RPC
     MNN_PRINT("[MNN::Hexagon][OfflineRPC] Attention shape: inputs=%zu outputs=%zu\n", inputs.size(), outputs.size());
     for (size_t i = 0; i < inputs.size(); ++i) {
@@ -187,8 +188,10 @@ ErrorCode HexagonAttention::onBuildCmd(const std::vector<Tensor*>& inputs, const
     const bool streamingState = inputs.size() == 7 && outputs.size() == 3;
     const bool visionState = inputs.size() == 4 && outputs.size() == 1 && inputs[0] != nullptr &&
                              inputs[1] != nullptr && inputs[2] != nullptr && inputs[0]->dimensions() == 4 &&
-                             inputs[1]->dimensions() == 4 && inputs[2]->dimensions() == 4;
+                             inputs[1]->dimensions() == 4 && inputs[2]->dimensions() == 4 &&
+                             TensorUtils::getDescribe(inputs[2])->dimensionFormat != MNN_DATA_FORMAT_NC4HW4;
     if (visionState) {
+        mVisionState = true;
         auto Q = inputs[0];
         auto K = inputs[1];
         auto V = inputs[2];
@@ -213,12 +216,13 @@ ErrorCode HexagonAttention::onBuildCmd(const std::vector<Tensor*>& inputs, const
         const int headDim = Q->length(3);
         const float scale = mAttnScale == 0.0f ? 1.0f / std::sqrt(static_cast<float>(headDim)) : mAttnScale;
         VisionAttentionParam params = {Q->length(0), tokens, Q->length(2), headDim, scale, maskStride};
+        const int dspOp = headDim % 64 == 0 ? DSP_OP_VISION_FLASH_ATTENTION_FP16 : DSP_OP_VISION_ATTENTION_FP16;
         std::vector<std::pair<int, int>> inputFds = {
             HexagonBackend::getDevicePtr(Q), HexagonBackend::getDevicePtr(K), HexagonBackend::getDevicePtr(V),
             mask != nullptr ? HexagonBackend::getDevicePtr(mask) : std::make_pair(-1, 0)};
         dst.emplace_back();
-        dst.back().build(static_cast<HexagonBackend*>(backend()), DSP_OP_VISION_ATTENTION_FP16, &params, sizeof(params),
-                         inputFds, {HexagonBackend::getDevicePtr(output)}, {Q, K, V, mask}, {output});
+        dst.back().build(static_cast<HexagonBackend*>(backend()), dspOp, &params, sizeof(params), inputFds,
+                         {HexagonBackend::getDevicePtr(output)}, {Q, K, V, mask}, {output});
         return NO_ERROR;
     }
     if (mMeta != nullptr && streamingState) {
@@ -465,7 +469,7 @@ ErrorCode HexagonAttention::onExecute(const std::vector<Tensor*>& inputs, const 
     if (!mValid) {
         return NOT_SUPPORT;
     }
-    if (mMeta == nullptr) {
+    if (mVisionState || mMeta == nullptr) {
         return HexagonExecution::onExecute(inputs, outputs);
     }
     const int seq_current = (int)mMeta->previous - (int)mMeta->remove;
