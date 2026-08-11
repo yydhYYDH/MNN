@@ -704,6 +704,13 @@ int htp_execute_command(MmapManager* mmap_manager, const DSPCOMMAND::Command* co
                                                 floatParams[4], intParams[5]);
             break;
         }
+        case DSP_OP_VISION_FLASH_ATTENTION_FP16: {
+            ret = htp_ops_vision_flash_attention_fp16(mapped_ptrs[inputs->size()], mapped_ptrs[0], mapped_ptrs[1],
+                                                      mapped_ptrs[2], inputs->size() > 3 ? mapped_ptrs[3] : nullptr,
+                                                      nullptr, intParams[0], intParams[1], intParams[2], intParams[3],
+                                                      floatParams[4], intParams[5]);
+            break;
+        }
         case DSP_OP_GET_INFO: {
             ret = htp_ops_getInfo_impl(mapped_ptrs[0]);
             break;
