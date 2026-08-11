@@ -105,19 +105,23 @@ int createRequest(const char *path) {
   return 0;
 }
 
-int createAsymmetricRequest(const char *path, const char *referencePath, uint32_t m, uint32_t k) {
-  constexpr uint32_t n = 32;
+int createAsymmetricRequest(const char *path, const char *referencePath, uint32_t m, uint32_t k, uint32_t n) {
   if (k == 0 || (k % 64) != 0) {
     fprintf(stderr, "Asymmetric Q4 K must be a positive multiple of 64, got %u\n", k);
     return 1;
   }
+  if (n == 0 || (n % 32) != 0) {
+    fprintf(stderr, "Asymmetric Q4 N must be a positive multiple of 32, got %u\n", n);
+    return 1;
+  }
   const uint32_t scaleBlocks = k / 64;
+  const uint32_t outputPack = ((n + 63) / 64) * 64;
   const uint32_t activationBytes = m * k * sizeof(uint16_t);
   const uint32_t packedWeightBytes = k * n / 2;
   const uint32_t scaleBytes = n * scaleBlocks * 2 * 2 * sizeof(uint16_t);
   const uint32_t weightBytes = packedWeightBytes + scaleBytes;
   const uint32_t biasBytes = n * sizeof(uint16_t);
-  const uint32_t outputBytes = m * 64 * sizeof(uint16_t);
+  const uint32_t outputBytes = m * outputPack * sizeof(uint16_t);
   const OfflineRpcBufferDesc buffers[] = {
     { 201, activationBytes, 2048, 0,                       1 },
     { 202, weightBytes,     2048, 0,                       1 },
@@ -131,8 +135,8 @@ int createAsymmetricRequest(const char *path, const char *referencePath, uint32_
   std::vector<uint8_t> rawWeight(n * k / 2);
   std::vector<uint8_t> weight(weightBytes, 0);
   std::vector<uint16_t> bias(n, 0);
-  std::vector<uint16_t> result(m * 64, 0);
-  std::vector<float> reference(m * 64, 0.0f);
+  std::vector<uint16_t> result(m * outputPack, 0);
+  std::vector<float> reference(m * outputPack, 0.0f);
   for (uint32_t row = 0; row < m; ++row) {
     for (uint32_t ki = 0; ki < k; ++ki) {
       const size_t index = static_cast<size_t>(row) * k + ki;
@@ -152,30 +156,33 @@ int createAsymmetricRequest(const char *path, const char *referencePath, uint32_
     }
   }
 
-  for (uint32_t x = 0; x < k / 32; ++x) {
-    uint8_t local[32 * 32] = {};
-    uint8_t shuffled[32 * 32] = {};
-    for (uint32_t yi = 0; yi < 32; ++yi) {
-      const uint8_t *src = rawWeight.data() + yi * (k / 2) + x * 16;
-      for (uint32_t xi = 0; xi < 16; ++xi) {
-        local[2 * xi * 32 + 2 * yi] = src[xi] >> 4;
-        local[2 * xi * 32 + 2 * yi + 1] = src[xi] & 0x0f;
+  for (uint32_t oy = 0; oy < n / 32; ++oy) {
+    for (uint32_t x = 0; x < k / 32; ++x) {
+      uint8_t local[32 * 32] = {};
+      uint8_t shuffled[32 * 32] = {};
+      for (uint32_t yi = 0; yi < 32; ++yi) {
+        const uint32_t o = oy * 32 + yi;
+        const uint8_t *src = rawWeight.data() + o * (k / 2) + x * 16;
+        for (uint32_t xi = 0; xi < 16; ++xi) {
+          local[2 * xi * 32 + 2 * yi] = src[xi] >> 4;
+          local[2 * xi * 32 + 2 * yi + 1] = src[xi] & 0x0f;
+        }
       }
-    }
-    for (uint32_t q = 0; q < 8; ++q) {
-      const uint8_t *src = local + q * 128;
-      uint8_t *dst = shuffled + q * 128;
-      for (uint32_t i = 0; i < 64; ++i) {
-        dst[2 * i] = src[i];
-        dst[2 * i + 1] = src[64 + i];
+      for (uint32_t q = 0; q < 8; ++q) {
+        const uint8_t *src = local + q * 128;
+        uint8_t *dst = shuffled + q * 128;
+        for (uint32_t i = 0; i < 64; ++i) {
+          dst[2 * i] = src[i];
+          dst[2 * i + 1] = src[64 + i];
+        }
       }
-    }
-    uint8_t *dst = weight.data() + x * 32 * 16;
-    for (uint32_t q = 0; q < 4; ++q) {
-      const uint8_t *low = shuffled + q * 256;
-      const uint8_t *high = low + 128;
-      for (uint32_t i = 0; i < 128; ++i) {
-        dst[q * 128 + i] = static_cast<uint8_t>((low[i] & 0x0f) | ((high[i] & 0x0f) << 4));
+      uint8_t *dst = weight.data() + (oy * (k / 32) + x) * 32 * 16;
+      for (uint32_t q = 0; q < 4; ++q) {
+        const uint8_t *low = shuffled + q * 256;
+        const uint8_t *high = low + 128;
+        for (uint32_t i = 0; i < 128; ++i) {
+          dst[q * 128 + i] = static_cast<uint8_t>((low[i] & 0x0f) | ((high[i] & 0x0f) << 4));
+        }
       }
     }
   }
@@ -183,16 +190,19 @@ int createAsymmetricRequest(const char *path, const char *referencePath, uint32_
   uint16_t *scaleData = reinterpret_cast<uint16_t *>(weight.data() + packedWeightBytes);
   for (uint32_t block = 0; block < scaleBlocks; ++block) {
     for (uint32_t o = 0; o < n; ++o) {
+      const uint32_t oy = o / 32;
+      const uint32_t localO = o % 32;
+      const size_t scaleBase = (static_cast<size_t>(oy) * scaleBlocks + block) * 128;
       const float scale = (1 + ((o + block) % 3)) * 0.125f;
       const float offset = (static_cast<int>((o + 2 * block) % 5) - 2) * 0.25f;
-      scaleData[block * 128 + 2 * o] = floatToFp16(scale);
-      scaleData[block * 128 + 2 * o + 1] = floatToFp16(scale);
-      scaleData[block * 128 + 64 + 2 * o] = floatToFp16(offset);
-      scaleData[block * 128 + 64 + 2 * o + 1] = floatToFp16(offset);
+      scaleData[scaleBase + 2 * localO] = floatToFp16(scale);
+      scaleData[scaleBase + 2 * localO + 1] = floatToFp16(scale);
+      scaleData[scaleBase + 64 + 2 * localO] = floatToFp16(offset);
+      scaleData[scaleBase + 64 + 2 * localO + 1] = floatToFp16(offset);
       for (uint32_t row = 0; row < m; ++row) {
         for (uint32_t ki = block * 64; ki < (block + 1) * 64; ++ki) {
-          reference[row * 64 + o] += activationFloat[row * k + ki] *
-                                     (logicalWeight[o * k + ki] * scale + offset);
+          reference[row * outputPack + o] += activationFloat[row * k + ki] *
+                                              (logicalWeight[o * k + ki] * scale + offset);
         }
       }
     }
@@ -207,7 +217,8 @@ int createAsymmetricRequest(const char *path, const char *referencePath, uint32_
     DSPCOMMAND::CreateTensor(builder, 204, 0, outputBytes)
   };
   const int32_t params[] = { static_cast<int32_t>(m), static_cast<int32_t>(k), static_cast<int32_t>(n),
-                             0, 1, 1, 1, static_cast<int32_t>(k / 32), static_cast<int32_t>(scaleBlocks), 1 };
+                             0, 1, 1, static_cast<int32_t>(n / 32), static_cast<int32_t>(k / 32),
+                             static_cast<int32_t>(scaleBlocks), 1 };
   auto command = DSPCOMMAND::CreateCommand(builder, 34, builder.CreateVector(inputs), builder.CreateVector(outputs),
                                            builder.CreateVector(params, 10));
   builder.Finish(command);
@@ -541,13 +552,17 @@ int main(int argc, char **argv) {
     return createW8BlockRequest(argv[2], argv[3], 1, 2, true);
   }
   if (argc == 4 && strcmp(argv[1], "create-asymmetric") == 0) {
-    return createAsymmetricRequest(argv[2], argv[3], 64, 64);
+    return createAsymmetricRequest(argv[2], argv[3], 64, 64, 32);
   }
   if (argc == 4 && strcmp(argv[1], "create-asymmetric-m1") == 0) {
-    return createAsymmetricRequest(argv[2], argv[3], 1, 64);
+    return createAsymmetricRequest(argv[2], argv[3], 1, 64, 32);
   }
   if (argc == 5 && strcmp(argv[1], "create-asymmetric-m1-k") == 0) {
-    return createAsymmetricRequest(argv[2], argv[3], 1, static_cast<uint32_t>(strtoul(argv[4], nullptr, 10)));
+    return createAsymmetricRequest(argv[2], argv[3], 1, static_cast<uint32_t>(strtoul(argv[4], nullptr, 10)), 32);
+  }
+  if (argc == 6 && strcmp(argv[1], "create-asymmetric-m1-kn") == 0) {
+    return createAsymmetricRequest(argv[2], argv[3], 1, static_cast<uint32_t>(strtoul(argv[4], nullptr, 10)),
+                                   static_cast<uint32_t>(strtoul(argv[5], nullptr, 10)));
   }
   if (argc == 4 && strcmp(argv[1], "verify-reference") == 0) {
     return verifyReference(argv[2], argv[3]);
@@ -556,6 +571,7 @@ int main(int argc, char **argv) {
     fprintf(stderr,
             "Usage: %s create|verify|inspect FILE | create-asymmetric REQUEST REFERENCE | "
             "create-asymmetric-m1 REQUEST REFERENCE | create-asymmetric-m1-k REQUEST REFERENCE K | "
+            "create-asymmetric-m1-kn REQUEST REFERENCE K N | "
             "verify-reference RESPONSE REFERENCE\n",
             argv[0]);
     return 64;

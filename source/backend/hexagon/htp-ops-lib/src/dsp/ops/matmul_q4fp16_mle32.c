@@ -250,7 +250,6 @@ static inline void process_q4_weight_chunk(const process_chunk_task_state_t* sta
             const uint8_t* block_scale_ptr = state->b_scale +
                 ((size_t)(oy - state->scale_oy_start) * state->scale_block_num + scale_idx) * scale_block_bytes;
             const HVX_Vector vBlockScale = vmemu(block_scale_ptr);
-            const HVX_Vector vBlockOffset = state->scale_asymmetric ? vmemu(block_scale_ptr + 128) : Q6_V_vzero();
             const HVX_Vector* src_vec = (const HVX_Vector*)src;
             HVX_Vector* dst_vec = (HVX_Vector*)dst;
             HVX_Vector vq0 = src_vec[0];
@@ -286,6 +285,7 @@ static inline void process_q4_weight_chunk(const process_chunk_task_state_t* sta
             dst_vec[14] = Q6_Vhf_vmpy_VhfVhf(Q6_V_lo_W(vp_hi3), vBlockScale);
             dst_vec[15] = Q6_Vhf_vmpy_VhfVhf(Q6_V_hi_W(vp_hi3), vBlockScale);
             if (state->scale_asymmetric && !state->defer_asymmetric_offset) {
+              const HVX_Vector vBlockOffset = vmemu(block_scale_ptr + 128);
               for (int i = 0; i < 16; ++i) {
                 dst_vec[i] = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_VhfVhf(dst_vec[i], vBlockOffset));
               }
@@ -502,10 +502,17 @@ static int hmx_matmulq4fp16_mle32_part(const MatmulParam *param) {
     if (NUM_CHUNKS > weight_dma_count) {
       NUM_CHUNKS = weight_dma_count;
     }
+    if (stage_block_scales) {
+      const int pair_aligned_chunks = (weight_dma_count + 1) / 2;
+      if (NUM_CHUNKS > pair_aligned_chunks) {
+        NUM_CHUNKS = pair_aligned_chunks;
+      }
+    }
     if (NUM_CHUNKS < 1) {
       NUM_CHUNKS = 1;
     }
-    int async_store = weight_dma_count > 32;
+    int async_store = weight_dma_count > 32 ||
+                      (stage_block_scales && weight_dma_count * scale_block_num >= 128);
 
     int chunk_size = (weight_dma_count + NUM_CHUNKS - 1) / NUM_CHUNKS;
     if (chunk_size > 1) {
@@ -515,7 +522,21 @@ static int hmx_matmulq4fp16_mle32_part(const MatmulParam *param) {
     int chunk_starts[NUM_CHUNKS];
     int current_start = 0;
     int validChunk = 0;
-    for (int i = 0; i < NUM_CHUNKS; ++i) {
+    if (stage_block_scales) {
+      const int pair_count = weight_dma_count / 2;
+      const int base_pairs = pair_count / NUM_CHUNKS;
+      const int extra_pairs = pair_count % NUM_CHUNKS;
+      for (int i = 0; i < NUM_CHUNKS; ++i) {
+        chunk_starts[i] = current_start;
+        chunk_counts[i] = 2 * (base_pairs + (i < extra_pairs ? 1 : 0));
+        if (i == NUM_CHUNKS - 1 && (weight_dma_count & 1)) {
+          ++chunk_counts[i];
+        }
+        current_start += chunk_counts[i];
+      }
+      validChunk = NUM_CHUNKS;
+    } else {
+      for (int i = 0; i < NUM_CHUNKS; ++i) {
         chunk_starts[i] = current_start;
         int end = current_start + chunk_size;
         if (end >= weight_dma_count) {
@@ -527,6 +548,7 @@ static int hmx_matmulq4fp16_mle32_part(const MatmulParam *param) {
         if (current_start >= weight_dma_count) {
           break;
         }
+      }
     }
 
     _Alignas(64) dma_desc_1d_t weight_desc[NUM_CHUNKS];

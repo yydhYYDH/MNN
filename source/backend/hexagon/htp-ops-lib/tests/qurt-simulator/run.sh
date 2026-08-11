@@ -80,6 +80,10 @@ if [[ "${MNN_OFFLINE_RPC_ASYMMETRIC_Q4:-0}" == "1" ]]; then
         if [[ -n "${MNN_OFFLINE_RPC_Q4_K:-}" ]]; then
             ASYMMETRIC_CREATE_MODE="create-asymmetric-m1-k"
             ASYMMETRIC_CREATE_ARGS+=("${MNN_OFFLINE_RPC_Q4_K}")
+            if [[ -n "${MNN_OFFLINE_RPC_Q4_N:-}" ]]; then
+                ASYMMETRIC_CREATE_MODE="create-asymmetric-m1-kn"
+                ASYMMETRIC_CREATE_ARGS+=("${MNN_OFFLINE_RPC_Q4_N}")
+            fi
         fi
     fi
     "${HOST_BUILD_DIR}/mnn_htp_offline_rpc_host" "${ASYMMETRIC_CREATE_MODE}" \
