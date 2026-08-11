@@ -12,12 +12,20 @@ if(MNN_OFFLINE_RPC_HOST_ONLY)
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../3rd_party/flatbuffers/include)
     if(MNN_OFFLINE_RPC_MNN_BUILD_DIR)
         add_executable(mnn_htp_mnn_matmul_record mnn_matmul_record.cpp)
+        add_executable(mnn_htp_linear_attention_record linear_attention_record.cpp)
         add_executable(mnn_htp_mnn_variable_dump mnn_variable_dump.cpp)
         target_compile_features(mnn_htp_mnn_matmul_record PRIVATE cxx_std_11)
+        target_compile_features(mnn_htp_linear_attention_record PRIVATE cxx_std_11)
         target_compile_features(mnn_htp_mnn_variable_dump PRIVATE cxx_std_11)
         target_include_directories(mnn_htp_mnn_matmul_record PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../..
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../include)
+        target_include_directories(mnn_htp_linear_attention_record PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../source
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../schema/current
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../include
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../3rd_party/flatbuffers/include)
         target_include_directories(mnn_htp_mnn_variable_dump PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../..
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../include
@@ -25,10 +33,15 @@ if(MNN_OFFLINE_RPC_HOST_ONLY)
         target_link_libraries(mnn_htp_mnn_matmul_record PRIVATE
             ${MNN_OFFLINE_RPC_MNN_BUILD_DIR}/libMNN.so
             ${MNN_OFFLINE_RPC_MNN_BUILD_DIR}/express/libMNN_Express.so)
+        target_link_libraries(mnn_htp_linear_attention_record PRIVATE
+            ${MNN_OFFLINE_RPC_MNN_BUILD_DIR}/libMNN.so
+            ${MNN_OFFLINE_RPC_MNN_BUILD_DIR}/express/libMNN_Express.so)
         target_link_libraries(mnn_htp_mnn_variable_dump PRIVATE
             ${MNN_OFFLINE_RPC_MNN_BUILD_DIR}/libMNN.so
             ${MNN_OFFLINE_RPC_MNN_BUILD_DIR}/express/libMNN_Express.so)
         set_target_properties(mnn_htp_mnn_matmul_record PROPERTIES
+            BUILD_RPATH "${MNN_OFFLINE_RPC_MNN_BUILD_DIR};${MNN_OFFLINE_RPC_MNN_BUILD_DIR}/express")
+        set_target_properties(mnn_htp_linear_attention_record PROPERTIES
             BUILD_RPATH "${MNN_OFFLINE_RPC_MNN_BUILD_DIR};${MNN_OFFLINE_RPC_MNN_BUILD_DIR}/express")
         set_target_properties(mnn_htp_mnn_variable_dump PROPERTIES
             BUILD_RPATH "${MNN_OFFLINE_RPC_MNN_BUILD_DIR};${MNN_OFFLINE_RPC_MNN_BUILD_DIR}/express")

@@ -6,8 +6,9 @@
 #include "core/OpCommonUtils.hpp"
 #include "backend/hexagon/htp-ops-lib/include/htp_command.h"
 #include <algorithm>
+#include <limits>
 namespace MNN {
-//#define HEXAGON_DEBUG
+// #define HEXAGON_DEBUG
 
 namespace {
 static void appendZeroCmd(HexagonBackend* backend, Tensor* output, std::vector<HexagonCommand>& dst) {
@@ -18,7 +19,7 @@ static void appendZeroCmd(HexagonBackend* backend, Tensor* output, std::vector<H
     std::vector<std::pair<int, int>> outputFds = {dstDev};
     std::vector<Tensor*> cmdOutputs = {output};
     dst.emplace_back();
-    dst.back().build(backend, DSP_OP_ZERO, params, sizeof(params), inputFds,  outputFds,  {}, cmdOutputs);
+    dst.back().build(backend, DSP_OP_ZERO, params, sizeof(params), inputFds, outputFds, {}, cmdOutputs);
 }
 
 static int computeArea(const Tensor* tensor) {
@@ -27,6 +28,32 @@ static int computeArea(const Tensor* tensor) {
         area *= tensor->length(d);
     }
     return area;
+}
+
+static bool isFullLinearC4Reshape(const Tensor::InsideDescribe::Region& region, const Tensor* output, int pack) {
+    const Tensor* origin = region.origin;
+    if (origin == nullptr || pack <= 0 || origin->dimensions() <= 1 || origin->dimensions() > 4 ||
+        output->dimensions() <= 1 || output->dimensions() > 4) {
+        return false;
+    }
+    const auto* originDes = TensorUtils::getDescribe(origin);
+    const auto* outputDes = TensorUtils::getDescribe(output);
+    if (originDes == nullptr || outputDes == nullptr || originDes->dimensionFormat != MNN_DATA_FORMAT_NC4HW4 ||
+        outputDes->dimensionFormat != MNN_DATA_FORMAT_NC4HW4) {
+        return false;
+    }
+    if (origin->channel() % pack != 0 || output->channel() % pack != 0 || region.src.offset != 0 ||
+        region.dst.offset != 0 || !TensorUtils::isCopyRegion(region)) {
+        return false;
+    }
+    const size_t regionSize = static_cast<size_t>(region.size[0]) * region.size[1] * region.size[2];
+    const size_t originSize = TensorUtils::getRawSize(origin);
+    const size_t outputSize = TensorUtils::getRawSize(output);
+    if (regionSize != originSize || regionSize != outputSize) {
+        return false;
+    }
+    return origin->batch() != output->batch() || origin->channel() != output->channel() ||
+           computeArea(origin) != computeArea(output);
 }
 
 static bool turnArea1ChannelSliceToC4Regions(const Tensor::InsideDescribe::Region& slice, const Tensor* output,
@@ -49,8 +76,8 @@ static bool turnArea1ChannelSliceToC4Regions(const Tensor::InsideDescribe::Regio
     if (slice.size[0] != batch || slice.size[1] != dstChannel || slice.size[2] != 1) {
         return false;
     }
-    if (slice.src.stride[0] != srcChannel || slice.src.stride[1] != 1 ||
-        slice.dst.stride[0] != dstChannel || slice.dst.stride[1] != 1) {
+    if (slice.src.stride[0] != srcChannel || slice.src.stride[1] != 1 || slice.dst.stride[0] != dstChannel ||
+        slice.dst.stride[1] != 1) {
         return false;
     }
     if (slice.src.offset < 0 || slice.dst.offset != 0 || slice.src.offset + dstChannel > srcChannel) {
@@ -82,9 +109,8 @@ static bool turnArea1ChannelSliceToC4Regions(const Tensor::InsideDescribe::Regio
             const int dstLane = copied;
             if (!segments.empty()) {
                 auto& last = segments.back();
-                if (last.blockStart + last.blockCount == dstBlock &&
-                    last.srcBlockDelta == srcBlockDelta && last.srcLane == srcLane &&
-                    last.dstLane == dstLane && last.len == len) {
+                if (last.blockStart + last.blockCount == dstBlock && last.srcBlockDelta == srcBlockDelta &&
+                    last.srcLane == srcLane && last.dstLane == dstLane && last.len == len) {
                     last.blockCount++;
                     copied += len;
                     continue;
@@ -129,10 +155,9 @@ static bool turnAlignedC4Region(const Tensor::InsideDescribe::Region& slice, con
     region.dst.offset /= pack;
     return true;
 }
-}
+} // namespace
 
-HexagonRaster::HexagonRaster(Backend* backend) : HexagonExecution(backend) {
-}
+HexagonRaster::HexagonRaster(Backend* backend) : HexagonExecution(backend) {}
 
 HexagonRaster::~HexagonRaster() = default;
 
@@ -144,6 +169,9 @@ void HexagonRaster::releaseDynamicTemps() {
     }
     if (mTempOutput && TensorUtils::getDescribeOrigin(mTempOutput.get())->mem.get() != nullptr) {
         backend()->onReleaseBuffer(mTempOutput.get(), Backend::DYNAMIC);
+    }
+    if (mC4ReshapeTemp && TensorUtils::getDescribeOrigin(mC4ReshapeTemp.get())->mem.get() != nullptr) {
+        backend()->onReleaseBuffer(mC4ReshapeTemp.get(), Backend::DYNAMIC);
     }
 }
 
@@ -164,6 +192,7 @@ ErrorCode HexagonRaster::onBuildCmd(const std::vector<Tensor*>& inputs, const st
     mTempInput.clear();
     mCacheRegions.clear();
     mTempOutput = nullptr;
+    mC4ReshapeTemp = nullptr;
     mTempInputCopy.clear();
 
     mSingleConvert.type = 0;
@@ -188,7 +217,8 @@ ErrorCode HexagonRaster::onBuildCmd(const std::vector<Tensor*>& inputs, const st
                 convertType = 2;
                 if (source == MNN_DATA_FORMAT_NC4HW4) {
                     auto pack = static_cast<const HexagonRuntime*>(backend()->getRuntime())->info().vectorSize;
-                    if (pack <= 0) pack = 4;
+                    if (pack <= 0)
+                        pack = 4;
                     channel = UP_DIV(channel, pack) * pack;
                 }
             } else {
@@ -196,7 +226,9 @@ ErrorCode HexagonRaster::onBuildCmd(const std::vector<Tensor*>& inputs, const st
             }
             int params[] = {batch, area, channel, mBytes, convertType};
 #ifdef HEXAGON_DEBUG
-            MNN_PRINT("HexagonRaster single convert cmd params: batch=%d, area=%d, channel=%d, mBytes=%d, convertType=%d\n", batch, area, channel, mBytes, convertType);
+            MNN_PRINT(
+                "HexagonRaster single convert cmd params: batch=%d, area=%d, channel=%d, mBytes=%d, convertType=%d\n",
+                batch, area, channel, mBytes, convertType);
 #endif
             std::vector<std::pair<int, int>> inputFds = {srcDev};
             std::vector<std::pair<int, int>> outputFds = {dstDev};
@@ -205,12 +237,40 @@ ErrorCode HexagonRaster::onBuildCmd(const std::vector<Tensor*>& inputs, const st
             std::vector<Tensor*> cmdOutputs = {output};
             dst.emplace_back();
             dst.back().build(static_cast<HexagonBackend*>(backend()), DSP_OP_TENSOR_CONVERT, params, sizeof(params),
-                             inputFds,  outputFds,  cmdInputs, cmdOutputs);
+                             inputFds, outputFds, cmdInputs, cmdOutputs);
             return NO_ERROR;
         }
     }
     mRegionCount = (int)des->regions.size();
     if (mRegionCount == 0) {
+        return NO_ERROR;
+    }
+
+    if (mRegionCount == 1 && isFullLinearC4Reshape(des->regions[0], output, pack)) {
+        auto* origin = des->regions[0].origin;
+        const size_t tempBytes = TensorUtils::getRawSize(origin) * mBytes;
+        if (tempBytes > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            return NOT_SUPPORT;
+        }
+        mC4ReshapeTemp.reset(Tensor::createDevice<int8_t>({static_cast<int>(tempBytes)}));
+        if (!backend()->onAcquireBuffer(mC4ReshapeTemp.get(), Backend::DYNAMIC)) {
+            mC4ReshapeTemp.reset();
+            return OUT_OF_MEMORY;
+        }
+
+        const auto srcDev = HexagonBackend::getDevicePtr(origin);
+        const auto tempDev = HexagonBackend::getDevicePtr(mC4ReshapeTemp.get());
+        const auto dstDev = HexagonBackend::getDevicePtr(output);
+        int unpackParams[] = {origin->batch(), computeArea(origin), origin->channel(), mBytes, 0};
+        int packParams[] = {output->batch(), computeArea(output), output->channel(), mBytes, 1};
+
+        dst.emplace_back();
+        dst.back().build(hexagonBackend, DSP_OP_TENSOR_CONVERT, unpackParams, sizeof(unpackParams), {srcDev}, {tempDev},
+                         {origin}, {mC4ReshapeTemp.get()});
+        dst.emplace_back();
+        dst.back().build(hexagonBackend, DSP_OP_TENSOR_CONVERT, packParams, sizeof(packParams), {tempDev}, {dstDev},
+                         {mC4ReshapeTemp.get()}, {output});
+        backend()->onReleaseBuffer(mC4ReshapeTemp.get(), Backend::DYNAMIC);
         return NO_ERROR;
     }
 
@@ -234,35 +294,36 @@ ErrorCode HexagonRaster::onBuildCmd(const std::vector<Tensor*>& inputs, const st
             }
             const int inner = slice.size[2];
             const bool supportFlattenCW =
-                originDes->dimensionFormat == MNN_DATA_FORMAT_NC4HW4 &&
-                origin->batch() == 1 && dstArea == 1 && inner > 0 &&
-                origin->channel() % pack == 0 && output->channel() == origin->channel() * inner &&
-                output->batch() == slice.size[0] && srcArea == slice.size[0] * inner &&
-                slice.src.offset == 0 && slice.dst.offset == 0 &&
-                slice.src.stride[0] == origin->width() && slice.src.stride[1] == srcArea && slice.src.stride[2] == 1 &&
-                slice.dst.stride[0] == output->channel() && slice.dst.stride[1] == inner && slice.dst.stride[2] == 1;
+                originDes->dimensionFormat == MNN_DATA_FORMAT_NC4HW4 && origin->batch() == 1 && dstArea == 1 &&
+                inner > 0 && origin->channel() % pack == 0 && output->channel() == origin->channel() * inner &&
+                output->batch() == slice.size[0] && srcArea == slice.size[0] * inner && slice.src.offset == 0 &&
+                slice.dst.offset == 0 && slice.src.stride[0] == origin->width() && slice.src.stride[1] == srcArea &&
+                slice.src.stride[2] == 1 && slice.dst.stride[0] == output->channel() && slice.dst.stride[1] == inner &&
+                slice.dst.stride[2] == 1;
             if (supportFlattenCW) {
                 auto srcDev = HexagonBackend::getDevicePtr(origin);
                 auto dstDev = HexagonBackend::getDevicePtr(output);
                 int params[] = {output->batch(), inner, origin->channel(), mBytes, 3};
 #ifdef HEXAGON_DEBUG
-                MNN_PRINT("HexagonRaster flatten-cw convert cmd params: batch=%d, inner=%d, channel=%d, mBytes=%d, convertType=3\n",
-                          params[0], params[1], params[2], params[3]);
+                MNN_PRINT(
+                    "HexagonRaster flatten-cw convert cmd params: batch=%d, inner=%d, channel=%d, mBytes=%d, "
+                    "convertType=3\n",
+                    params[0], params[1], params[2], params[3]);
 #endif
                 std::vector<std::pair<int, int>> inputFds = {srcDev};
                 std::vector<std::pair<int, int>> outputFds = {dstDev};
                 std::vector<Tensor*> cmdInputs = {origin};
                 std::vector<Tensor*> cmdOutputs = {output};
                 dst.emplace_back();
-                dst.back().build(hexagonBackend, DSP_OP_TENSOR_CONVERT, params, sizeof(params),
-                                 inputFds, outputFds, cmdInputs, cmdOutputs);
+                dst.back().build(hexagonBackend, DSP_OP_TENSOR_CONVERT, params, sizeof(params), inputFds, outputFds,
+                                 cmdInputs, cmdOutputs);
                 return NO_ERROR;
             }
         }
     }
 
-    if (pack > 0 && MNN_DATA_FORMAT_NC4HW4 == outputDes->dimensionFormat &&
-        output->dimensions() > 1 && output->dimensions() <= 4) {
+    if (pack > 0 && MNN_DATA_FORMAT_NC4HW4 == outputDes->dimensionFormat && output->dimensions() > 1 &&
+        output->dimensions() <= 4) {
         bool supportArea1C4 = true;
         std::vector<std::pair<Tensor*, Tensor::InsideDescribe::Region*>> c4Copies;
         std::vector<std::shared_ptr<Tensor::InsideDescribe::Region>> c4Regions;
@@ -447,7 +508,8 @@ ErrorCode HexagonRaster::onBuildCmd(const std::vector<Tensor*>& inputs, const st
                 convertType = 2;
                 if (source == MNN_DATA_FORMAT_NC4HW4) {
                     auto pack = static_cast<const HexagonRuntime*>(backend()->getRuntime())->info().vectorSize;
-                    if (pack <= 0) pack = 4;
+                    if (pack <= 0)
+                        pack = 4;
                     channel = UP_DIV(channel, pack) * pack;
                 }
             } else {
@@ -455,7 +517,9 @@ ErrorCode HexagonRaster::onBuildCmd(const std::vector<Tensor*>& inputs, const st
             }
             int params[] = {batch, area, channel, mBytes, convertType};
 #ifdef HEXAGON_DEBUG
-            MNN_PRINT("HexagonRaster pre convert cmd params: batch=%d, area=%d, channel=%d, mBytes=%d, convertType=%d\n", batch, area, channel, mBytes, convertType);
+            MNN_PRINT(
+                "HexagonRaster pre convert cmd params: batch=%d, area=%d, channel=%d, mBytes=%d, convertType=%d\n",
+                batch, area, channel, mBytes, convertType);
 #endif
             std::vector<std::pair<int, int>> inputFds = {srcDev};
             std::vector<std::pair<int, int>> outputFds = {dstDev};
@@ -464,7 +528,7 @@ ErrorCode HexagonRaster::onBuildCmd(const std::vector<Tensor*>& inputs, const st
             std::vector<Tensor*> cmdOutputs = {output};
             dst.emplace_back();
             dst.back().build(static_cast<HexagonBackend*>(backend()), DSP_OP_TENSOR_CONVERT, params, sizeof(params),
-                             inputFds,  outputFds,  cmdInputs, cmdOutputs);
+                             inputFds, outputFds, cmdInputs, cmdOutputs);
         }
     }
 
@@ -514,7 +578,11 @@ ErrorCode HexagonRaster::onBuildCmd(const std::vector<Tensor*>& inputs, const st
         }
 #ifdef HEXAGON_DEBUG
         auto& reg = regions[i];
-        MNN_PRINT("i:%d, size: %d, %d, %d, srcIndex: %d, srcOffset:%d, dstOffset:%d, srcStride: %d, %d, %d, dstStride: %d, %d, %d\n", i, reg.size[0], reg.size[1], reg.size[2], reg.srcIndex, reg.srcOffset, reg.dstOffset, reg.srcStride[0], reg.srcStride[1], reg.srcStride[2], reg.dstStride[0], reg.dstStride[1], reg.dstStride[2]);
+        MNN_PRINT(
+            "i:%d, size: %d, %d, %d, srcIndex: %d, srcOffset:%d, dstOffset:%d, srcStride: %d, %d, %d, dstStride: %d, "
+            "%d, %d\n",
+            i, reg.size[0], reg.size[1], reg.size[2], reg.srcIndex, reg.srcOffset, reg.dstOffset, reg.srcStride[0],
+            reg.srcStride[1], reg.srcStride[2], reg.dstStride[0], reg.dstStride[1], reg.dstStride[2]);
 #endif
     }
 
@@ -556,10 +624,12 @@ ErrorCode HexagonRaster::onBuildCmd(const std::vector<Tensor*>& inputs, const st
         params->regionCount = groupRegions.size();
         params->bytes = rasterBytes;
         params->srcNumber = groupSrcCount;
-        memcpy(paramData.data() + sizeof(MergedRasterParam), groupRegions.data(), groupRegions.size() * sizeof(RasterRegion));
+        memcpy(paramData.data() + sizeof(MergedRasterParam), groupRegions.data(),
+               groupRegions.size() * sizeof(RasterRegion));
 
 #ifdef HEXAGON_DEBUG
-        MNN_PRINT("HexagonRaster raster blit cmd params: regionCount=%d, mBytes=%d, src_number=%d\n", (int)groupRegions.size(), rasterBytes, groupSrcCount);
+        MNN_PRINT("HexagonRaster raster blit cmd params: regionCount=%d, mBytes=%d, src_number=%d\n",
+                  (int)groupRegions.size(), rasterBytes, groupSrcCount);
 #endif
         std::vector<std::pair<int, int>> inputFds = groupSrcFds;
         std::vector<std::pair<int, int>> outputFds = {dstDev};
@@ -573,7 +643,7 @@ ErrorCode HexagonRaster::onBuildCmd(const std::vector<Tensor*>& inputs, const st
 
         dst.emplace_back();
         dst.back().build(static_cast<HexagonBackend*>(backend()), DSP_OP_RASTER_BLIT, paramData.data(), paramSize,
-                         inputFds,  outputFds,  cmdInputs, cmdOutputs);
+                         inputFds, outputFds, cmdInputs, cmdOutputs);
     }
     if (nullptr != mTempOutput) {
         auto input = mTempOutput.get();
@@ -597,7 +667,8 @@ ErrorCode HexagonRaster::onBuildCmd(const std::vector<Tensor*>& inputs, const st
             convertType = 2;
             if (source == MNN_DATA_FORMAT_NC4HW4) {
                 auto pack = static_cast<const HexagonRuntime*>(backend()->getRuntime())->info().vectorSize;
-                if (pack <= 0) pack = 4;
+                if (pack <= 0)
+                    pack = 4;
                 channel = UP_DIV(channel, pack) * pack;
             }
         } else {
@@ -605,7 +676,8 @@ ErrorCode HexagonRaster::onBuildCmd(const std::vector<Tensor*>& inputs, const st
         }
         int params2[] = {batch, area, channel, mBytes, convertType};
 #ifdef HEXAGON_DEBUG
-        MNN_PRINT("HexagonRaster post convert cmd params: batch=%d, area=%d, channel=%d, mBytes=%d, convertType=%d\n", batch, area, channel, mBytes, convertType);
+        MNN_PRINT("HexagonRaster post convert cmd params: batch=%d, area=%d, channel=%d, mBytes=%d, convertType=%d\n",
+                  batch, area, channel, mBytes, convertType);
 #endif
         std::vector<std::pair<int, int>> inputFds2 = {srcDev2};
         std::vector<std::pair<int, int>> outputFds2 = {dstDev2};
@@ -614,7 +686,7 @@ ErrorCode HexagonRaster::onBuildCmd(const std::vector<Tensor*>& inputs, const st
         std::vector<Tensor*> cmdOutputs2 = {outputTensor};
         dst.emplace_back();
         dst.back().build(static_cast<HexagonBackend*>(backend()), DSP_OP_TENSOR_CONVERT, params2, sizeof(params2),
-                         inputFds2,  outputFds2,  cmdInputs2, cmdOutputs2);
+                         inputFds2, outputFds2, cmdInputs2, cmdOutputs2);
     }
 
     releaseDynamicTemps();

@@ -14,6 +14,7 @@
 #include "HexagonLayerNorm.hpp"
 #include "HexagonRoPE.hpp"
 #include "HexagonAttention.hpp"
+#include "HexagonLinearAttention.hpp"
 #include "HexagonSelect.hpp"
 #include "HexagonTopKV2.hpp"
 #include "HexagonSoftmax.hpp"
@@ -26,8 +27,7 @@
 
 namespace MNN {
 
-static void logUnsupportedOp(const Op* op, const std::vector<Tensor*>& inputs,
-                             const std::vector<Tensor*>& outputs) {
+static void logUnsupportedOp(const Op* op, const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) {
     if (op == nullptr) {
         MNN_PRINT("[MNN::Hexagon] create unsupported: null op, inputs=%zu, outputs=%zu\n", inputs.size(),
                   outputs.size());
@@ -40,7 +40,7 @@ static void logUnsupportedOp(const Op* op, const std::vector<Tensor*>& inputs,
 }
 
 Execution* HexagonExecutionFactory::create(const Op* op, const std::vector<Tensor*>& inputs,
-                                          const std::vector<Tensor*>& outputs, Backend* backend) {
+                                           const std::vector<Tensor*>& outputs, Backend* backend) {
     if (op == nullptr) {
         logUnsupportedOp(op, inputs, outputs);
         return nullptr;
@@ -105,6 +105,9 @@ Execution* HexagonExecutionFactory::create(const Op* op, const std::vector<Tenso
             return HexagonRoPE::create(backend, op);
         case OpType_Attention:
             execution = HexagonAttention::create(backend, op);
+            break;
+        case OpType_LinearAttention:
+            execution = HexagonLinearAttention::create(backend, op);
             break;
         case OpType_Select:
             execution = HexagonSelect::create(backend, op);

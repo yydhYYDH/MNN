@@ -1033,6 +1033,22 @@ void HexagonRuntime::flushCommand() const {
                         }
                     }
                 }
+                const char* outputIndexOverride = getenv("MNN_HEXAGON_OFFLINE_RPC_OUTPUT_INDEX");
+                if (outputIndexOverride != nullptr && outputIndexOverride[0] != '\0' &&
+                    lastCommand->outputs() != nullptr) {
+                    const long outputIndex = strtol(outputIndexOverride, nullptr, 10);
+                    if (outputIndex >= 0 && outputIndex < lastCommand->outputs()->size()) {
+                        const auto* output = lastCommand->outputs()->Get(static_cast<flatbuffers::uoffset_t>(outputIndex));
+                        mOfflineOutputFd = static_cast<uint32_t>(output->fd());
+                        mOfflineOutputOffset = static_cast<uint32_t>(output->offset());
+                        for (const auto& record : mPendingHexagonOutputs) {
+                            if (record.fd == output->fd() && record.offset == output->offset()) {
+                                mOfflineOutputSize = static_cast<uint32_t>(record.size);
+                                break;
+                            }
+                        }
+                    }
+                }
             }
             const char* outputBytesOverride = getenv("MNN_HEXAGON_OFFLINE_RPC_OUTPUT_BYTES");
             if (outputBytesOverride != nullptr && outputBytesOverride[0] != '\0') {
