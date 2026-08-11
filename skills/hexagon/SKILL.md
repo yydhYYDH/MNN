@@ -180,12 +180,15 @@ description: MNN Hexagon/HVX/HMX DSP 后端（`source/backend/hexagon`）的优�
 
 ## HVX/HMX 指引
 
-- HVX 指令细节参考 `~/Download/hvx.pdf`。
-- 引入新的 intrinsic 写法之前，先找项目里已有的例子。
-- 只在对齐有保证时用 `vmem`；不对齐访问用 `vmemu`。
-- DMA/HVX/HMX 的改动要落在"内存流量"和"实测算子时间"上。
-- HMX 路径在加宽 tile 或 block 之前，先核对 VTCM 分配大小、tile 数和 descriptor 数。
-- 不要假设一个微优化能在 v79/v81 之间通用；针对目标架构构建并测试。不通用的原因、以及如何用单台设备验证 arch 假设，见「双架构」。
+- For HVX instruction details, read `~/Download/hvx.pdf`.
+- Prefer existing project examples before introducing new intrinsic patterns.
+- Use `vmem` only when alignment is guaranteed; use `vmemu` for unaligned accesses.
+- When carving aligned HMX regions from a heap allocation, align the allocation base as well as every offset. An
+  unaligned DSP `malloc` base plus 128-byte-aligned offsets is still unaligned and may silently corrupt HMX numerics
+  without an RPC error or crash. Keep the original allocation pointer for `free`.
+- Keep DMA/HVX/HMX changes grounded in memory traffic and measured op time.
+- For HMX paths, verify VTCM allocation sizes, tile counts, and descriptor counts before widening a tile or block.
+- Do not assume a micro-optimization is portable across v79/v81; build and test the target architecture.
 
 ## QuRT Simulator Checks
 
@@ -208,6 +211,22 @@ description: MNN Hexagon/HVX/HMX DSP 后端（`source/backend/hexagon`）的优�
 - For deep FP16 graphs, preserve max error but also report RMS/NRMSE, cosine similarity, non-finite count, and repeat
   determinism. Define acceptance thresholds before judging the result; do not silently weaken a failing FP32-oriented
   max-error check.
+- To separate command/interface bugs from an accelerated-kernel bug, temporarily dispatch the new command to a known
+  scalar oracle without changing its host inputs, parameters, or outputs. If correctness returns, keep the command
+  contract fixed and inspect packing, alignment, workspace sizing, and output layout inside the accelerated kernel.
+
+## Stateful Multimodal Execution
+
+- Do not infer that an Attention command is an LLM KV-cache command merely because the backend exposes non-null
+  `KVMeta`. A multimodal runtime can expose that metadata while building or executing the Vision module.
+- Persist the Attention mode selected from the tensors during command construction. The Vision execute path must not
+  rewrite its parameter buffer as an LLM `FlashAttnParam`, append a page-table input, or run KV-cache reallocation.
+- When dynamic shapes fail but a fixed micrograph passes, inspect the final serialized command immediately before it
+  is queued: op id, complete parameter words, input count, fd/offset, and output mapping. An unexpected extra input or
+  shape field changed to zero is stronger evidence than progressively bypassing DSP kernel stages.
+- A successful RPC return and plausible `DSPOpType` time prove execution, not semantic correctness. Final multimodal
+  acceptance requires a real image prompt, meaningful generated text, both Vision and LLM Hexagon profile entries,
+  and a negative scan for DSP/RPC/crash signatures. Keep a small CPU-reference Vision graph as the numerical gate.
 
 ## DSP DMA-BUF Memory Measurement
 
