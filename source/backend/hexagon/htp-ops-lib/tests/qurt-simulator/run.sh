@@ -70,6 +70,37 @@ cmake -S "${SCRIPT_DIR}" -B "${HOST_BUILD_DIR}" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release -DMNN_OFFLINE_RPC_HOST_ONLY=ON
 cmake --build "${HOST_BUILD_DIR}" --target mnn_htp_offline_rpc_host -j"${MNN_QURT_SIM_JOBS:-4}"
 
+if [[ "${MNN_OFFLINE_RPC_ASYMMETRIC_Q4:-0}" == "1" ]]; then
+    ASYMMETRIC_REQUEST="${BUILD_ROOT}/q4_asymmetric_request.bin"
+    ASYMMETRIC_REFERENCE="${BUILD_ROOT}/q4_asymmetric_reference.bin"
+    ASYMMETRIC_CREATE_MODE="create-asymmetric"
+    if [[ "${MNN_OFFLINE_RPC_Q4_M:-64}" == "1" ]]; then
+        ASYMMETRIC_CREATE_MODE="create-asymmetric-m1"
+    fi
+    "${HOST_BUILD_DIR}/mnn_htp_offline_rpc_host" "${ASYMMETRIC_CREATE_MODE}" \
+        "${ASYMMETRIC_REQUEST}" "${ASYMMETRIC_REFERENCE}"
+    MNN_OFFLINE_RPC_REQUEST="${ASYMMETRIC_REQUEST}"
+    MNN_OFFLINE_RPC_REFERENCE="${ASYMMETRIC_REFERENCE}"
+fi
+if [[ "${MNN_OFFLINE_RPC_W8_BLOCK:-0}" == "1" ]]; then
+    W8_BLOCK_REQUEST="${BUILD_ROOT}/w8_block_request.bin"
+    W8_BLOCK_REFERENCE="${BUILD_ROOT}/w8_block_reference.bin"
+    W8_BLOCK_CREATE_MODE="create-w8-block"
+    if [[ "${MNN_OFFLINE_RPC_W8_BLOCK_M:-64}" == "1" ]]; then
+        W8_BLOCK_CREATE_MODE="create-w8-block-m1"
+    fi
+    if [[ "${MNN_OFFLINE_RPC_W8_ASYMMETRIC:-0}" == "1" ]]; then
+        W8_BLOCK_CREATE_MODE="create-w8-block-asymmetric"
+        if [[ "${MNN_OFFLINE_RPC_W8_BLOCK_M:-64}" == "1" ]]; then
+            W8_BLOCK_CREATE_MODE="create-w8-block-asymmetric-m1"
+        fi
+    fi
+    "${HOST_BUILD_DIR}/mnn_htp_offline_rpc_host" "${W8_BLOCK_CREATE_MODE}" \
+        "${W8_BLOCK_REQUEST}" "${W8_BLOCK_REFERENCE}"
+    MNN_OFFLINE_RPC_REQUEST="${W8_BLOCK_REQUEST}"
+    MNN_OFFLINE_RPC_REFERENCE="${W8_BLOCK_REFERENCE}"
+fi
+
 cmake -S "${SCRIPT_DIR}" -B "${RUNNER_BUILD_DIR}" "${COMMON_CMAKE_ARGS[@]}" \
     "-DMNN_HTPOPS_SKEL=${SKEL_SO}"
 cmake --build "${RUNNER_BUILD_DIR}" --target mnn_htp_qurt_runner -j"${MNN_QURT_SIM_JOBS:-4}"
