@@ -43,8 +43,8 @@ private:
     std::map<Tensor*, std::shared_ptr<Tensor>> mTempInput;
     std::vector<std::pair<Tensor*, Tensor::InsideDescribe::Region*>> mTempInputCopy;
     std::shared_ptr<Tensor> mTempOutput;
+    std::shared_ptr<Tensor> mC4ReshapeTemp;
     std::vector<std::shared_ptr<Tensor::InsideDescribe::Region>> mCacheRegions;
-
 };
 
 } // namespace MNN

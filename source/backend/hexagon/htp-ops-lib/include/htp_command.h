@@ -71,6 +71,9 @@ enum DSPOpType {
     DSP_OP_RELU,
     DSP_OP_BATCH_MATMUL,
     DSP_OP_PRELU,
+    // Qwen3.5 gated-delta linear attention. The command owns both the
+    // depthwise-convolution state and recurrent state update on the DSP.
+    DSP_OP_LINEAR_ATTENTION_GATED_DELTA,
     DSP_OP_CONV1X1_DIRECT_W8A16_SYM_PER_CHANNEL,
     DSP_OP_MATMUL_Q4A16_GEMV_I8,
     DSP_OP_VISION_ATTENTION_FP16,

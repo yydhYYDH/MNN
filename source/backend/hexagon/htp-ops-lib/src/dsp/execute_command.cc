@@ -130,6 +130,13 @@ extern AEEResult htp_ops_lstm(uint8_t* y, uint8_t* yh, uint8_t* yc, const uint8_
                               int32 seqLength, int32 batch, int32 inputSize, int32 hiddenSize,
                               int32 direction, int32 bytes, int32 outputCount, int32 scratchBytes,
                               uint8_t* scratch, const int32* sizes, int32 packedWeightBytes);
+
+extern AEEResult htp_ops_linear_attention_gated_delta(
+    uint8_t* output, uint8_t* convOutput, const uint8_t* qkv, const uint8_t* gate, const uint8_t* beta,
+    const uint8_t* convWeight, uint8_t* convState, uint8_t* recurrentState,
+    int32 batch, int32 convDim, int32 seqLen, int32 numKHeads, int32 numVHeads,
+    int32 headKDim, int32 headVDim, int32 convKernel, int32 qkvC4, int32 gateC4,
+    int32 betaC4, int32 outputC4, int32 weightC4, int32 useQKL2Norm, int32 c4Pack);
 extern AEEResult htp_ops_im2col_convolution_fp16(uint8_t* output, uint8_t* input, uint8_t* weight, uint8_t* bias,
                                                  const HmxIm2ColConvParam* params);
 
@@ -652,6 +659,18 @@ int htp_execute_command(MmapManager* mmap_manager, const DSPCOMMAND::Command* co
                                intParams[0], intParams[1], intParams[2], intParams[3],
                                intParams[4], intParams[5], outputCount, intParams[16],
                                scratch, intParams + 7, packedWeightBytes);
+            break;
+        }
+        case DSP_OP_LINEAR_ATTENTION_GATED_DELTA: {
+            if (inputs->size() != 6 || outputs->size() != 4) {
+                ret = AEE_EBADPARM;
+                break;
+            }
+            ret = htp_ops_linear_attention_gated_delta(
+                mapped_ptrs[inputs->size()], mapped_ptrs[inputs->size() + 3], mapped_ptrs[0], mapped_ptrs[1],
+                mapped_ptrs[2], mapped_ptrs[3], mapped_ptrs[4], mapped_ptrs[5], intParams[0], intParams[1],
+                intParams[2], intParams[3], intParams[4], intParams[5], intParams[6], intParams[7],
+                intParams[8], intParams[9], intParams[10], intParams[11], intParams[12], intParams[13], intParams[14]);
             break;
         }
         case DSP_OP_WEIGHT_REORDER: {
