@@ -639,30 +639,51 @@ int htp_execute_command(MmapManager* mmap_manager, const DSPCOMMAND::Command* co
             break;
         }
         case DSP_OP_IM2COL_CONVOLUTION_FP16: {
-            const HmxIm2ColConvParam* im2colParams = reinterpret_cast<const HmxIm2ColConvParam*>(intParams);
+            HmxIm2ColConvParam im2colParams = {};
+            size_t paramBytes = params ? params->size() * sizeof(int32_t) : 0;
+            if (paramBytes > sizeof(im2colParams)) paramBytes = sizeof(im2colParams);
+            if (paramBytes > 0) memcpy(&im2colParams, intParams, paramBytes);
             ret = htp_ops_im2col_convolution_fp16(mapped_ptrs[inputs->size()],
                                                   mapped_ptrs[0],
                                                   mapped_ptrs[1],
                                                   mapped_ptrs[2],
-                                                  im2colParams);
+                                                  &im2colParams);
             break;
         }
         case DSP_OP_CONV1X1_DIRECT_W8A16_SYM_PER_CHANNEL: {
-            const HmxIm2ColConvParam* im2colParams = reinterpret_cast<const HmxIm2ColConvParam*>(intParams);
+            HmxIm2ColConvParam im2colParams = {};
+            size_t paramBytes = params ? params->size() * sizeof(int32_t) : 0;
+            if (paramBytes > sizeof(im2colParams)) paramBytes = sizeof(im2colParams);
+            if (paramBytes > 0) memcpy(&im2colParams, intParams, paramBytes);
             ret = hmx_conv1x1_direct_w8a16_sym_per_channel(mapped_ptrs[inputs->size()],
                                                            mapped_ptrs[0],
                                                            mapped_ptrs[1],
                                                            mapped_ptrs[2],
-                                                           im2colParams);
+                                                           &im2colParams);
+            break;
+        }
+        case DSP_OP_MATMUL_W8A16_BLOCK_FP16: {
+            HmxIm2ColConvParam matmulParams = {};
+            size_t paramBytes = params ? params->size() * sizeof(int32_t) : 0;
+            if (paramBytes > sizeof(matmulParams)) paramBytes = sizeof(matmulParams);
+            if (paramBytes > 0) memcpy(&matmulParams, intParams, paramBytes);
+            ret = hmx_matmul_w8a16_block_fp16(mapped_ptrs[inputs->size()],
+                                              mapped_ptrs[0],
+                                              mapped_ptrs[1],
+                                              mapped_ptrs[2],
+                                              &matmulParams);
             break;
         }
         case DSP_OP_CONV1X1_DIRECT_FP16: {
-            const HmxIm2ColConvParam* im2colParams = reinterpret_cast<const HmxIm2ColConvParam*>(intParams);
+            HmxIm2ColConvParam im2colParams = {};
+            size_t paramBytes = params ? params->size() * sizeof(int32_t) : 0;
+            if (paramBytes > sizeof(im2colParams)) paramBytes = sizeof(im2colParams);
+            if (paramBytes > 0) memcpy(&im2colParams, intParams, paramBytes);
             ret = htp_ops_conv1x1_direct_fp16(mapped_ptrs[inputs->size()],
                                               mapped_ptrs[0],
                                               mapped_ptrs[1],
                                               mapped_ptrs[2],
-                                              im2colParams);
+                                              &im2colParams);
             break;
         }
         case DSP_OP_VISION_ATTENTION_FP16: {

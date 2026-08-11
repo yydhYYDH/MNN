@@ -287,7 +287,7 @@ static int limitQ4BlockDecodeNp(int currentNp, int totalNp, int KAlign, int scal
 }
 
 static bool reorderInt4WeightForHmx(uint8_t* dst, size_t dstBytes, const uint8_t* rawInt4Data, const float* rawAlphaData,
-                                    int rawAlphaSize, int ic, int oc, int scaleBlockNum,
+                                    int rawAlphaSize, int ic, int oc, int scaleBlockNum, bool scaleAsymmetric,
                                     void(*fp32tofp16)(const float*, int16_t*, size_t)) {
     const int icP = UP_DIV(ic, 32);
     const int ocP = UP_DIV(oc, 32);
@@ -297,15 +297,16 @@ static bool reorderInt4WeightForHmx(uint8_t* dst, size_t dstBytes, const uint8_t
     int16_t* dstScale = reinterpret_cast<int16_t*>(dst + (size_t)icP * ocP * 32 * 16);
     const int scaleBlocks = std::max(scaleBlockNum, 1);
     const bool dequantInWeight = scaleBlocks > 1;
-    const int scaleUnit = dequantInWeight ? 64 : 32;
-    const int packedScaleBlocks = dequantInWeight ? UP_DIV(scaleBlocks, 2) : 0;
+    const int alphaUnit = scaleAsymmetric ? 2 : 1;
+    const int scaleUnit = dequantInWeight ? (scaleAsymmetric ? 128 : 64) : 32;
+    const int packedScaleBlocks = dequantInWeight && !scaleAsymmetric ? UP_DIV(scaleBlocks, 2) : 0;
     int16_t* dstPackedScale = dequantInWeight ? dstScale + (size_t)ocP * scaleBlocks * scaleUnit : nullptr;
     const size_t weightBytes = (size_t)icP * ocP * 32 * 16;
     const size_t scaleBytes = (size_t)ocP * scaleBlocks * scaleUnit * sizeof(int16_t);
     const size_t packedScaleBytes = (size_t)ocP * packedScaleBlocks * 64 * sizeof(int16_t);
     const size_t neededBytes = weightBytes + scaleBytes + packedScaleBytes;
 
-    if (neededBytes > dstBytes || (rawAlphaData != nullptr && rawAlphaSize < oc * scaleBlocks)) {
+    if (neededBytes > dstBytes || (rawAlphaData != nullptr && rawAlphaSize < oc * scaleBlocks * alphaUnit)) {
         MNN_PRINT("[MNN::Hexagon][int4] invalid q4block reorder bounds: ic=%d oc=%d icP=%d ocP=%d scaleBlocks=%d alpha=%d need=%zu dst=%zu weight=%zu scale=%zu packed=%zu\n",
                   ic, oc, icP, ocP, scaleBlocks, rawAlphaSize, neededBytes, dstBytes, weightBytes, scaleBytes, packedScaleBytes);
         return false;
@@ -380,23 +381,36 @@ static bool reorderInt4WeightForHmx(uint8_t* dst, size_t dstBytes, const uint8_t
         }
     } else if (rawAlphaData != nullptr && oc > 0) {
         const int blockUnit = 64;
-        std::vector<float> scaleTile((size_t)scaleBlocks * blockUnit);
+        std::vector<float> scaleTile((size_t)scaleBlocks * scaleUnit);
         for (int y = 0; y < ocP; ++y) {
             for (int k = 0; k < scaleBlocks; ++k) {
-                float* dstFloat = scaleTile.data() + (size_t)k * blockUnit;
+                float* dstFloat = scaleTile.data() + (size_t)k * scaleUnit;
                 for (int yi = 0; yi < 32; ++yi) {
                     const int o = y * 32 + yi;
                     float scale = 0.0f;
+                    float offset = 0.0f;
                     if (o < oc) {
                         const size_t scaleIndex = (size_t)o * scaleBlocks + k;
-                        scale = rawAlphaData[scaleIndex];
+                        if (scaleAsymmetric) {
+                            offset = rawAlphaData[2 * scaleIndex];
+                            scale = rawAlphaData[2 * scaleIndex + 1];
+                        } else {
+                            scale = rawAlphaData[scaleIndex];
+                        }
                     }
                     dstFloat[2 * yi] = scale;
                     dstFloat[2 * yi + 1] = scale;
+                    if (scaleAsymmetric) {
+                        dstFloat[blockUnit + 2 * yi] = offset;
+                        dstFloat[blockUnit + 2 * yi + 1] = offset;
+                    }
                 }
             }
-            int16_t* dstScaleTile = dstScale + (size_t)y * scaleBlocks * blockUnit;
-            fp32tofp16(scaleTile.data(), dstScaleTile, (size_t)scaleBlocks * blockUnit);
+            int16_t* dstScaleTile = dstScale + (size_t)y * scaleBlocks * scaleUnit;
+            fp32tofp16(scaleTile.data(), dstScaleTile, (size_t)scaleBlocks * scaleUnit);
+            if (scaleAsymmetric) {
+                continue;
+            }
             int16_t* dstPackedScaleTile = dstPackedScale + (size_t)y * packedScaleBlocks * blockUnit;
             for (int k = 0; k < scaleBlocks; k += 2) {
                 int16_t* dstInt = dstPackedScaleTile + (size_t)(k / 2) * blockUnit;
@@ -416,7 +430,8 @@ static bool reorderInt4WeightForHmx(uint8_t* dst, size_t dstBytes, const uint8_t
 
 static bool reorderInt8SymWeightForHmx(uint8_t* dst, size_t dstBytes, const int8_t* rawInt8Data,
                                        const float* rawAlphaData, int rawAlphaSize,
-                                       int ic, int oc, int kernelX, int kernelY,
+                                       int ic, int oc, int kernelX, int kernelY, int scaleBlockNum,
+                                       bool scaleAsymmetric,
                                        void(*fp32tofp16)(const float*, int16_t*, size_t)) {
     constexpr int icPack = 32;
     constexpr int ocPack = 32;
@@ -425,10 +440,13 @@ static bool reorderInt8SymWeightForHmx(uint8_t* dst, size_t dstBytes, const int8
     const int kp = kernelY * kernelX * icP;
     constexpr int packs = icPack * ocPack;
     const size_t weightBytes = (size_t)ocP * kp * packs;
-    const size_t scaleBytes = (size_t)ocP * ocPack * sizeof(int16_t);
+    const int scaleBlocks = std::max(scaleBlockNum, 1);
+    const int alphaUnit = scaleAsymmetric ? 2 : 1;
+    const int scaleUnit = scaleAsymmetric ? 128 : (scaleBlocks > 1 ? 64 : 32);
+    const size_t scaleBytes = (size_t)ocP * scaleBlocks * scaleUnit * sizeof(int16_t);
     const size_t neededBytes = weightBytes + scaleBytes;
     if (dst == nullptr || rawInt8Data == nullptr || rawAlphaData == nullptr ||
-        rawAlphaSize < oc || neededBytes > dstBytes) {
+        rawAlphaSize < oc * scaleBlocks * alphaUnit || neededBytes > dstBytes) {
         MNN_PRINT("[MNN::Hexagon][int8] invalid w8 reorder bounds: ic=%d oc=%d alpha=%d need=%zu dst=%zu\n",
                   ic, oc, rawAlphaSize, neededBytes, dstBytes);
         return false;
@@ -436,7 +454,38 @@ static bool reorderInt8SymWeightForHmx(uint8_t* dst, size_t dstBytes, const int8
     ::memset(dst, 0, neededBytes);
     int8_t* dstWeight = reinterpret_cast<int8_t*>(dst);
     int16_t* dstScale = reinterpret_cast<int16_t*>(dst + weightBytes);
-    fp32tofp16(rawAlphaData, dstScale, oc);
+    if (scaleBlocks == 1 && !scaleAsymmetric) {
+        fp32tofp16(rawAlphaData, dstScale, oc);
+    } else {
+        std::vector<float> scaleTile((size_t)scaleBlocks * scaleUnit);
+        for (int oz = 0; oz < ocP; ++oz) {
+            for (int block = 0; block < scaleBlocks; ++block) {
+                float* dstBlock = scaleTile.data() + (size_t)block * scaleUnit;
+                for (int oy = 0; oy < ocPack; ++oy) {
+                    const int o = oz * ocPack + oy;
+                    float scale = 0.0f;
+                    float offset = 0.0f;
+                    if (o < oc) {
+                        const size_t scaleIndex = (size_t)o * scaleBlocks + block;
+                        if (scaleAsymmetric) {
+                            offset = rawAlphaData[2 * scaleIndex];
+                            scale = rawAlphaData[2 * scaleIndex + 1];
+                        } else {
+                            scale = rawAlphaData[scaleIndex];
+                        }
+                    }
+                    dstBlock[2 * oy] = scale;
+                    dstBlock[2 * oy + 1] = scale;
+                    if (scaleAsymmetric) {
+                        dstBlock[64 + 2 * oy] = offset;
+                        dstBlock[64 + 2 * oy + 1] = offset;
+                    }
+                }
+            }
+            fp32tofp16(scaleTile.data(), dstScale + (size_t)oz * scaleBlocks * scaleUnit,
+                       (size_t)scaleBlocks * scaleUnit);
+        }
+    }
 
     for (int oz = 0; oz < ocP; ++oz) {
         for (int kk = 0; kk < kp; ++kk) {
@@ -683,6 +732,9 @@ ErrorCode HexagonConvolution::onBuildCmd(const std::vector<Tensor *> &inputs, co
         im2colParams.relu6 = mRelu6;
         im2colParams.batch = batch;
         im2colParams.outputBytes = (int32_t)static_cast<HexagonBackend*>(backend())->getSize(outputs[0]);
+        im2colParams.scaleBlockNum = mResource && mResource->useInt8W8A16 ? mResource->int8ScaleBlockNum : 1;
+        im2colParams.scaleAsymmetric =
+            mResource && mResource->useInt8W8A16 && mResource->int8ScaleAsymmetric ? 1 : 0;
     }
 //    FUNC_PRINT(vtcmSize);
 //    FUNC_PRINT(mMp);
@@ -705,14 +757,16 @@ ErrorCode HexagonConvolution::onBuildCmd(const std::vector<Tensor *> &inputs, co
                                               : HexagonBackend::getDevicePtr(mResource->weight);
         std::vector<std::pair<int, int>> inputFds = {input, weight, bias};
         dst.emplace_back();
-        const auto opType = mResource->useInt8W8A16 ? DSP_OP_CONV1X1_DIRECT_W8A16_SYM_PER_CHANNEL
+        const auto opType = mResource->useInt8W8A16 ? DSP_OP_MATMUL_W8A16_BLOCK_FP16
                                                     : (useConv1x1Direct ? DSP_OP_CONV1X1_DIRECT_FP16 : DSP_OP_IM2COL_CONVOLUTION_FP16);
         dst.back().build(static_cast<HexagonBackend*>(backend()), opType, &im2colParams, sizeof(im2colParams),
                          inputFds,  outputFds,  inputs, outputs);
     } else if (mResource->useInt4W4A16) {
         // Kernel don't need treat not aligned ic / oc
         auto weight = HexagonBackend::getDevicePtr(mResource->int4Weight);
-        int params[] = {area, icP * 32, ocP * 32, mResource->int4WeightType, mResource->int4LayoutType, mMp, mNp, mKp, mResource->int4ScaleBlockNum, 0};
+        int params[] = {area, icP * 32, ocP * 32, mResource->int4WeightType, mResource->int4LayoutType,
+                        mMp, mNp, mKp, mResource->int4ScaleBlockNum,
+                        mResource->int4ScaleAsymmetric ? 1 : 0};
         std::vector<std::pair<int, int>> inputFds = {input, weight, bias};
         const auto opType = mResource->int4ScaleBlockNum > 1 ? DSP_OP_MATMUL_Q4A16_BLOCK_FP16 : DSP_OP_MATMUL_Q4A16_FP16;
         dst.emplace_back();
@@ -788,7 +842,7 @@ HexagonConvolution* HexagonConvolution::create(Backend *backend, const Op* op) {
             originWeightSize = quanCommon->weight.size();
         } else {
             quanCommon = ConvolutionCommon::load(op, backend, false, true, nullptr);
-            if (fastWay && quanCommon != nullptr && !quanCommon->asymmetric && quanCommon->weight.get() != nullptr &&
+            if (fastWay && quanCommon != nullptr && quanCommon->weight.get() != nullptr &&
                 quanCommon->alpha.get() != nullptr && quanCommon->alpha.size() >= oc &&
                 conv2d->quanParameter()->index() == nullptr) {
                 useInt8W8A16 = true;
@@ -822,29 +876,35 @@ HexagonConvolution* HexagonConvolution::create(Backend *backend, const Op* op) {
     auto ocP = UP_DIV(oc, ocPack);
     auto packs = icPack * ocPack;
     int int4ScaleBlockNum = 1;
-    if (useInt4W4A16 && quanCommon && quanCommon->alpha.get() != nullptr) {
-        if (quanCommon->asymmetric) {
-            MNN_PRINT("[MNN::Hexagon] asymmetric int4 scale is not supported by W4A16 HTP path, fallback to fp16 convolution\n");
-            useInt4W4A16 = false;
-            useIm2Col = true;
-            quanCommon = ConvolutionCommon::load(op, backend, true, false, nullptr);
-            originWeight = quanCommon->weightFloat.get();
-            originWeightSize = quanCommon->weightFloat.size();
-        }
-    }
+    int int8ScaleBlockNum = 1;
     if (useInt4W4A16 && quanCommon && quanCommon->alpha.get() != nullptr) {
         const int alphaSize = quanCommon->alpha.size();
-        const int alphaUnit = 1;
+        const int alphaUnit = quanCommon->asymmetric ? 2 : 1;
         if (alphaSize >= oc * alphaUnit && alphaSize % (oc * alphaUnit) == 0) {
             int4ScaleBlockNum = alphaSize / (oc * alphaUnit);
         }
-        if (int4ScaleBlockNum <= 0 || icP % int4ScaleBlockNum != 0) {
+        if (int4ScaleBlockNum <= 0 || icP % int4ScaleBlockNum != 0 ||
+            (quanCommon->asymmetric && int4ScaleBlockNum <= 1)) {
             useInt4W4A16 = false;
             useIm2Col = true;
             quanCommon = ConvolutionCommon::load(op, backend, true, false, nullptr);
             originWeight = quanCommon->weightFloat.get();
             originWeightSize = quanCommon->weightFloat.size();
             int4ScaleBlockNum = 1;
+        }
+    }
+    if (useInt8W8A16 && quanCommon && quanCommon->alpha.get() != nullptr) {
+        const int alphaSize = quanCommon->alpha.size();
+        const int alphaUnit = quanCommon->asymmetric ? 2 : 1;
+        if (alphaSize >= oc * alphaUnit && alphaSize % (oc * alphaUnit) == 0) {
+            int8ScaleBlockNum = alphaSize / (oc * alphaUnit);
+        }
+        if (int8ScaleBlockNum <= 0 || kernelSize != 1 || icP % int8ScaleBlockNum != 0) {
+            useInt8W8A16 = false;
+            quanCommon = ConvolutionCommon::load(op, backend, true, false, nullptr);
+            originWeight = quanCommon->weightFloat.get();
+            originWeightSize = quanCommon->weightFloat.size();
+            int8ScaleBlockNum = 1;
         }
     }
     auto weightIC = useIm2Col ? (kernelSize * icP * icPack) : ic;
@@ -870,8 +930,9 @@ HexagonConvolution* HexagonConvolution::create(Backend *backend, const Op* op) {
     bool int8Success = false;
     if (useInt4W4A16) {
         const bool dequantInWeight = int4ScaleBlockNum > 1;
-        const int scaleUnit = dequantInWeight ? 64 : 32;
-        const size_t packedScaleSize = dequantInWeight ? (size_t)ocP * UP_DIV(int4ScaleBlockNum, 2) * 64 * sizeof(int16_t) : 0;
+        const bool scaleAsymmetric = quanCommon->asymmetric;
+        const int scaleUnit = dequantInWeight ? (scaleAsymmetric ? 128 : 64) : 32;
+        const size_t packedScaleSize = dequantInWeight && !scaleAsymmetric ? (size_t)ocP * UP_DIV(int4ScaleBlockNum, 2) * 64 * sizeof(int16_t) : 0;
         const size_t int4WeightSize = (size_t)icP * ocP * 32 * 16 +
                                       (size_t)ocP * int4ScaleBlockNum * scaleUnit * sizeof(int16_t) +
                                       packedScaleSize;
@@ -882,6 +943,7 @@ HexagonConvolution* HexagonConvolution::create(Backend *backend, const Op* op) {
             res->int4WeightType = int4WeightType;
             res->int4LayoutType = int4LayoutType;
             res->int4ScaleBlockNum = int4ScaleBlockNum;
+            res->int4ScaleAsymmetric = scaleAsymmetric;
 
             const uint8_t* rawInt4Data = reinterpret_cast<const uint8_t*>(quanCommon->weight.get());
             const float* rawAlphaData = quanCommon->alpha.get();
@@ -891,6 +953,7 @@ HexagonConvolution* HexagonConvolution::create(Backend *backend, const Op* op) {
                 auto int4Ptr = HexagonBackend::getPtr(res->int4Weight);
                 if (!reorderInt4WeightForHmx(int4Ptr, int4WeightSize, rawInt4Data, rawAlphaData,
                                              quanCommon->alpha.size(), ic, oc, int4ScaleBlockNum,
+                                             scaleAsymmetric,
                                              HexagonBackend::fp32ToFp16)) {
                     return nullptr;
                 }
@@ -904,7 +967,9 @@ HexagonConvolution* HexagonConvolution::create(Backend *backend, const Op* op) {
     if (useInt8W8A16) {
         const size_t expectedWeightSize = (size_t)oc * ic * kernelSize;
         const size_t int8WeightBytes = im2colBlockedWeightSize;
-        const size_t int8ScaleBytes = (size_t)ocP * ocPack * sizeof(int16_t);
+        const bool int8ScaleAsymmetric = quanCommon->asymmetric;
+        const int int8ScaleUnit = int8ScaleAsymmetric ? 128 : (int8ScaleBlockNum > 1 ? 64 : 32);
+        const size_t int8ScaleBytes = (size_t)ocP * int8ScaleBlockNum * int8ScaleUnit * sizeof(int16_t);
         const size_t int8BufferSize = int8WeightBytes + int8ScaleBytes;
         if (quanCommon == nullptr || quanCommon->weight.get() == nullptr || quanCommon->alpha.get() == nullptr ||
             (size_t)quanCommon->weight.size() < expectedWeightSize || quanCommon->alpha.size() < oc) {
@@ -917,11 +982,14 @@ HexagonConvolution* HexagonConvolution::create(Backend *backend, const Op* op) {
         if (!reorderInt8SymWeightForHmx(reinterpret_cast<uint8_t*>(HexagonBackend::getPtr(res->int8Weight)),
                                         int8BufferSize, quanCommon->weight.get(), quanCommon->alpha.get(),
                                         quanCommon->alpha.size(), ic, oc,
-                                        common->kernelX(), common->kernelY(),
+                                        common->kernelX(), common->kernelY(), int8ScaleBlockNum,
+                                        int8ScaleAsymmetric,
                                         HexagonBackend::fp32ToFp16)) {
             return nullptr;
         }
         res->useInt8W8A16 = true;
+        res->int8ScaleBlockNum = int8ScaleBlockNum;
+        res->int8ScaleAsymmetric = int8ScaleAsymmetric;
         int8Success = true;
         static_cast<HexagonBackend*>(backend)->markHostInput(res->int8Weight, (int)int8BufferSize);
     }

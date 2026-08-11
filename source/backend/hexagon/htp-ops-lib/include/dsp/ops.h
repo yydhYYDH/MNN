@@ -59,6 +59,8 @@ typedef struct HmxIm2ColConvParam {
   int32_t         relu6;
   int32_t         batch;
   int32_t         outputBytes;
+  int32_t         scaleBlockNum;
+  int32_t         scaleAsymmetric;
 } HmxIm2ColConvParam;
 
 typedef struct WeightReorderParam {
@@ -72,6 +74,8 @@ int hmx_im2col_convolution_fp16(uint8_t *dst, const uint8_t *src, const uint8_t 
                                 const HmxIm2ColConvParam *params);
 int hmx_conv1x1_direct_w8a16_sym_per_channel(uint8_t *dst, const uint8_t *src, const uint8_t *weight,
                                              const uint8_t *bias, const HmxIm2ColConvParam *params);
+int hmx_matmul_w8a16_block_fp16(uint8_t *dst, const uint8_t *src, const uint8_t *weight,
+                                const uint8_t *bias, const HmxIm2ColConvParam *params);
 int htp_ops_conv1x1_direct_fp16(uint8_t *output, uint8_t *input, uint8_t *weight, uint8_t *bias,
                                 const HmxIm2ColConvParam *params);
 int htp_ops_vision_attention_fp16(uint8_t *output, const uint8_t *query, const uint8_t *key, const uint8_t *value,

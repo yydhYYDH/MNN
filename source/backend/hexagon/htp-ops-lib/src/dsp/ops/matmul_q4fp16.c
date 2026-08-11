@@ -216,7 +216,8 @@ static const __fp16 q4_to_fp16_lut[64] __attribute__((aligned(128))) = {
 };
 
 static inline void dequant_q4_tile_scaled(const uint8_t* src, __fp16* dst,
-                                          HVX_Vector vlut_cvt, HVX_Vector vBlockScale) {
+                                          HVX_Vector vlut_cvt, HVX_Vector vBlockScale,
+                                          HVX_Vector vBlockOffset, int scale_asymmetric) {
   const HVX_Vector* src_vec = (const HVX_Vector*)src;
   HVX_Vector* dst_vec = (HVX_Vector*)dst;
   HVX_Vector vq0 = src_vec[0];
@@ -251,19 +252,24 @@ static inline void dequant_q4_tile_scaled(const uint8_t* src, __fp16* dst,
   dst_vec[13] = Q6_Vhf_vmpy_VhfVhf(Q6_V_hi_W(vp_lo3), vBlockScale);
   dst_vec[14] = Q6_Vhf_vmpy_VhfVhf(Q6_V_lo_W(vp_hi3), vBlockScale);
   dst_vec[15] = Q6_Vhf_vmpy_VhfVhf(Q6_V_hi_W(vp_hi3), vBlockScale);
+  if (scale_asymmetric) {
+    for (int i = 0; i < 16; ++i) {
+      dst_vec[i] = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_VhfVhf(dst_vec[i], vBlockOffset));
+    }
+  }
 }
 
 static inline void process_q4_weight_lut(int oy_start, int start_idx, int count, int kp,
                                          const uint8_t* __restrict vtcm_weight_int4,
                                          __fp16* __restrict vtcm_weight,
-                                         const uint8_t* b_scale, int scale_block_num) {
+                                         const uint8_t* b_scale, int scale_block_num, int scale_asymmetric) {
   HVX_Vector vlut_cvt = vmemu(q4_to_fp16_lut);
   const int weight_int4_stride = 512 * kp;
   const int weight_fp16_stride = 1024 * kp;
   const uint8_t* src_oy = vtcm_weight_int4 + start_idx * weight_int4_stride;
   __fp16* dst_oy = vtcm_weight + start_idx * weight_fp16_stride;
   if (scale_block_num > 1) {
-    const int scale_block_bytes = 128;
+    const int scale_block_bytes = scale_asymmetric ? 256 : 128;
     for (int local_oy = 0; local_oy < count; ++local_oy) {
       const int oy = oy_start + start_idx + local_oy;
       const uint8_t* src = src_oy;
@@ -271,7 +277,8 @@ static inline void process_q4_weight_lut(int oy_start, int start_idx, int count,
       const uint8_t* block_scale_ptr = b_scale + (size_t)oy * scale_block_num * scale_block_bytes;
       if (scale_block_num == kp) {
         for (int k = 0; k < kp; ++k) {
-          dequant_q4_tile_scaled(src, dst, vlut_cvt, vmemu(block_scale_ptr));
+          dequant_q4_tile_scaled(src, dst, vlut_cvt, vmemu(block_scale_ptr),
+                                 scale_asymmetric ? vmemu(block_scale_ptr + 128) : Q6_V_vzero(), scale_asymmetric);
           block_scale_ptr += scale_block_bytes;
           src += 512;
           dst += 1024;
@@ -287,14 +294,18 @@ static inline void process_q4_weight_lut(int oy_start, int start_idx, int count,
             next_scale_k += k_per_scale;
             vBlockScale = vmemu(block_scale_ptr + scale_idx * scale_block_bytes);
           }
-          dequant_q4_tile_scaled(src, dst, vlut_cvt, vBlockScale);
+          const uint8_t* current_scale_ptr = block_scale_ptr + scale_idx * scale_block_bytes;
+          dequant_q4_tile_scaled(src, dst, vlut_cvt, vBlockScale,
+                                 scale_asymmetric ? vmemu(current_scale_ptr + 128) : Q6_V_vzero(), scale_asymmetric);
           src += 512;
           dst += 1024;
         }
       } else {
         for (int k = 0; k < kp; ++k) {
           const int scale_idx = (k * scale_block_num) / kp;
-          dequant_q4_tile_scaled(src, dst, vlut_cvt, vmemu(block_scale_ptr + scale_idx * scale_block_bytes));
+          const uint8_t* current_scale_ptr = block_scale_ptr + scale_idx * scale_block_bytes;
+          dequant_q4_tile_scaled(src, dst, vlut_cvt, vmemu(current_scale_ptr),
+                                 scale_asymmetric ? vmemu(current_scale_ptr + 128) : Q6_V_vzero(), scale_asymmetric);
           src += 512;
           dst += 1024;
         }
@@ -357,6 +368,7 @@ typedef struct {
   int count;
   int kp;
   int scale_block_num;
+  int scale_asymmetric;
   const uint8_t* b_scale;
   const uint8_t* vtcm_weight_int4;
   __fp16* vtcm_weight;
@@ -377,7 +389,7 @@ static void process_q4_weight_worker_loop(void* data, int _worker_index) {
   wait_q4_weight_dma_done(state->depend);
   process_q4_weight_lut(state->oy_start, state->start_idx, state->count, state->kp,
                         state->vtcm_weight_int4, state->vtcm_weight,
-                        state->b_scale, state->scale_block_num);
+                        state->b_scale, state->scale_block_num, state->scale_asymmetric);
   worker_pool_synctoken_jobdone(state->shared_sync);
 }
 
@@ -879,7 +891,6 @@ static void store_q4_output_worker_loop(void* data, int _worker_index) {
 int hmx_matmulq4fp16(uint8_t * c, const uint8_t * a, const uint8_t * b, const uint8_t * b_scale, const uint8_t * bias,
                           int M, int K, int N, int mp_max, int np_max, int kp_max, int scale_block_num, int scale_asymmetric) {
   if (scale_block_num <= 0) scale_block_num = 1;
-  (void)scale_asymmetric;
   const int dequant_in_weight = scale_block_num > 1;
   int np_chunk = np_max;
   if (np_chunk == 0) np_chunk = 1;
@@ -1063,6 +1074,7 @@ int hmx_matmulq4fp16(uint8_t * c, const uint8_t * a, const uint8_t * b, const ui
       chunk_states[i].count = chunk_counts[i];
       chunk_states[i].kp = kp;
       chunk_states[i].scale_block_num = scale_block_num;
+      chunk_states[i].scale_asymmetric = scale_asymmetric;
       chunk_states[i].b_scale = b_scale;
       chunk_states[i].vtcm_weight_int4 = vtcm_weight_int4;
       chunk_states[i].vtcm_weight = vtcm_weight;
