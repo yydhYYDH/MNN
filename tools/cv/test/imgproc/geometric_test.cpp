@@ -185,6 +185,51 @@ TEST(resize, 960_720) {
     EXPECT_TRUE(testEnv.equal());
 }
 
+TEST(resize, pillow_bicubic_8bit) {
+    const int channels = 3;
+    auto check = [channels](int inputWidth, int inputHeight, int outputWidth, int outputHeight,
+                            const std::vector<uint8_t>& expected) {
+        std::vector<uint8_t> input(static_cast<size_t>(inputWidth) * inputHeight * channels);
+        for (size_t i = 0; i < input.size(); ++i) {
+            input[i] = static_cast<uint8_t>((i * 37 + (i / channels) * 13 + 17) % 256);
+        }
+        auto source = _Const(input.data(), {inputHeight, inputWidth, channels}, NHWC, halide_type_of<uint8_t>());
+        auto output = resize(source, {outputWidth, outputHeight}, 0, 0, INTER_PILLOW_BICUBIC);
+        auto outputPtr = output->readMap<uint8_t>();
+        ASSERT_NE(outputPtr, nullptr);
+        EXPECT_EQ(0, ::memcmp(outputPtr, expected.data(), expected.size()));
+    };
+
+    check(3, 2, 5, 4,
+          {0,   33,  70,  65,  102, 139, 153, 190, 227, 60,  97,  134, 0,   24, 61,  36,  73,  110, 69,  106,
+           143, 112, 149, 186, 64,  101, 138, 28,  64,  101, 115, 152, 189, 78, 115, 152, 30,  67,  104, 73,
+           110, 147, 106, 143, 180, 155, 192, 229, 82,  119, 156, 0,   26,  63, 77,  114, 151, 146, 183, 220});
+    check(7, 5, 3, 2, {133, 123, 123, 126, 112, 119, 149, 105, 108, 123, 157, 113, 113, 146, 148, 102, 139, 142});
+}
+
+TEST(resize, opencv_cubic_8bit) {
+    const int channels = 3;
+    auto check = [channels](int inputWidth, int inputHeight, int outputWidth, int outputHeight,
+                            const std::vector<uint8_t>& expected) {
+        std::vector<uint8_t> input(static_cast<size_t>(inputWidth) * inputHeight * channels);
+        for (size_t i = 0; i < input.size(); ++i) {
+            input[i] = static_cast<uint8_t>((i * 37 + (i / channels) * 13 + 17) % 256);
+        }
+        auto source = _Const(input.data(), {inputHeight, inputWidth, channels}, NHWC, halide_type_of<uint8_t>());
+        auto output = resize(source, {outputWidth, outputHeight}, 0, 0, INTER_CUBIC);
+        auto outputPtr = output->readMap<uint8_t>();
+        ASSERT_NE(outputPtr, nullptr);
+        EXPECT_EQ(0, ::memcmp(outputPtr, expected.data(), expected.size()));
+    };
+
+    // Generated with OpenCV's scalar INTER_CUBIC path (cubic parameter -0.75, 11-bit fixed-point coefficients).
+    check(3, 2, 5, 4,
+          {0,   27,  64,  75,  112, 149, 156, 193, 230, 69,  106, 143, 0,   18,  55,  37,  74,  111, 74,  111,
+           148, 109, 146, 183, 69,  106, 143, 28,  65,  102, 114, 151, 188, 73,  110, 147, 33,  70,  107, 68,
+           105, 142, 179, 161, 198, 235, 73,  110, 147, 0,   23,  60,  67,  104, 141, 152, 189, 226});
+    check(7, 5, 3, 2, {205, 63, 105, 227, 39, 76, 204, 43, 86, 142, 179, 42, 152, 189, 226, 123, 160, 202});
+}
+
 // warpAffine
 TEST(warpAffine, scale) {
     std::vector<float> M { 0.5, 0, 0, 0, 0.8, 0 };

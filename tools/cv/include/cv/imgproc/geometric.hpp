@@ -27,7 +27,8 @@ enum InterpolationFlags {
     INTER_NEAREST_EXACT = 6,
     INTER_MAX = 7,
     WARP_FILL_OUTLIERS = 8,
-    WARP_INVERSE_MAP = 16
+    WARP_INVERSE_MAP = 16,
+    INTER_PILLOW_BICUBIC = 32
 };
 
 enum BorderTypes {
