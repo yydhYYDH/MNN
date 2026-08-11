@@ -717,7 +717,7 @@ class MNNConverter:
         if quant_bit == 16:
             quanParameter = { "type": 3 }
         else:
-            if self.args.sym:
+            if quant_sym:
                 aMin = 0
                 readType = 0
             else:
