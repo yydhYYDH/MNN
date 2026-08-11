@@ -74,11 +74,16 @@ if [[ "${MNN_OFFLINE_RPC_ASYMMETRIC_Q4:-0}" == "1" ]]; then
     ASYMMETRIC_REQUEST="${BUILD_ROOT}/q4_asymmetric_request.bin"
     ASYMMETRIC_REFERENCE="${BUILD_ROOT}/q4_asymmetric_reference.bin"
     ASYMMETRIC_CREATE_MODE="create-asymmetric"
+    ASYMMETRIC_CREATE_ARGS=()
     if [[ "${MNN_OFFLINE_RPC_Q4_M:-64}" == "1" ]]; then
         ASYMMETRIC_CREATE_MODE="create-asymmetric-m1"
+        if [[ -n "${MNN_OFFLINE_RPC_Q4_K:-}" ]]; then
+            ASYMMETRIC_CREATE_MODE="create-asymmetric-m1-k"
+            ASYMMETRIC_CREATE_ARGS+=("${MNN_OFFLINE_RPC_Q4_K}")
+        fi
     fi
     "${HOST_BUILD_DIR}/mnn_htp_offline_rpc_host" "${ASYMMETRIC_CREATE_MODE}" \
-        "${ASYMMETRIC_REQUEST}" "${ASYMMETRIC_REFERENCE}"
+        "${ASYMMETRIC_REQUEST}" "${ASYMMETRIC_REFERENCE}" "${ASYMMETRIC_CREATE_ARGS[@]}"
     MNN_OFFLINE_RPC_REQUEST="${ASYMMETRIC_REQUEST}"
     MNN_OFFLINE_RPC_REFERENCE="${ASYMMETRIC_REFERENCE}"
 fi

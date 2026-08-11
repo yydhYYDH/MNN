@@ -79,7 +79,8 @@ struct HexagonTileShape {
 enum class Q4ScaleMode {
     None,
     PerOutput,
-    Block,
+    BlockSymmetric,
+    BlockAsymmetric,
 };
 
 static HexagonTileShape chooseIm2ColTileShape(int totalMp, int totalNp, int KAlign, int availSize,
@@ -123,6 +124,7 @@ static HexagonTileShape chooseIm2ColTileShape(int totalMp, int totalNp, int KAli
 static HexagonTileShape chooseQ4BlockPrefillTileShape(HexagonTileShape base, int totalMp, int totalNp,
                                                       int KAlign, int vtcmSize);
 static int limitQ4BlockDecodeNp(int currentNp, int totalNp, int KAlign, int scaleBlockNum, int vtcmSize);
+static int chooseQ4AsymmetricDecodeNp(int totalNp, int KAlign, int scaleBlockNum, int vtcmSize);
 static HexagonTileShape chooseQ4PerOutputPrefillTileShape(HexagonTileShape base, int totalMp, int totalNp,
                                                           int KAlign, int vtcmSize);
 
@@ -141,12 +143,15 @@ static HexagonTileShape chooseDirectTileShape(int totalMp, int totalNp, int KAli
     if (tile.np + 2 * tile.mp < maxSum && tile.mp < totalMp) {
         tile.mp = std::min(totalMp, (maxSum - tile.np) / 2);
     }
-    if (q4ScaleMode == Q4ScaleMode::Block) {
+    if (q4ScaleMode == Q4ScaleMode::BlockSymmetric) {
         if (totalMp > 1) {
             return chooseQ4BlockPrefillTileShape(tile, totalMp, totalNp, KAlign, vtcmSize);
         }
         tile.np = limitQ4BlockDecodeNp(tile.np, totalNp, KAlign, scaleBlockNum, vtcmSize);
-    } else if (q4ScaleMode == Q4ScaleMode::PerOutput && tile.np > 1 && (tile.np & 1)) {
+    } else if (q4ScaleMode == Q4ScaleMode::BlockAsymmetric && totalMp == 1) {
+        tile.np = chooseQ4AsymmetricDecodeNp(totalNp, KAlign, scaleBlockNum, vtcmSize);
+    } else if ((q4ScaleMode == Q4ScaleMode::PerOutput || q4ScaleMode == Q4ScaleMode::BlockAsymmetric) &&
+               tile.np > 1 && (tile.np & 1)) {
         --tile.np;
     }
     if (q4ScaleMode == Q4ScaleMode::PerOutput) {
@@ -284,6 +289,26 @@ static int limitQ4BlockDecodeNp(int currentNp, int totalNp, int KAlign, int scal
         --safeNp;
     }
     return std::min(currentNp, std::min(totalNp, std::max(1, safeNp)));
+}
+
+static int chooseQ4AsymmetricDecodeNp(int totalNp, int KAlign, int scaleBlockNum, int vtcmSize) {
+    const size_t topReservedBytes = 16 * 1024;
+    const size_t safeVtcmSize = vtcmSize > (int)topReservedBytes ? (size_t)vtcmSize - topReservedBytes
+                                                                 : (size_t)vtcmSize;
+    const size_t activationSumBytes =
+        ((size_t)std::max(scaleBlockNum, 1) * sizeof(int16_t) + 127) & ~(size_t)127;
+    const size_t fixedBytes = (size_t)64 * KAlign + 256 + 64 + activationSumBytes;
+    const size_t blockScaleBytes = (size_t)std::max(scaleBlockNum, 1) * 256;
+    const size_t bytesPerNp = (size_t)64 * KAlign + (size_t)16 * KAlign + 2048 + 64 + blockScaleBytes;
+    if (safeVtcmSize <= fixedBytes || bytesPerNp == 0) {
+        return 1;
+    }
+    int safeNp = (int)((safeVtcmSize - fixedBytes) / bytesPerNp);
+    safeNp = std::min(totalNp, std::max(1, safeNp));
+    if (safeNp > 1 && (safeNp & 1)) {
+        --safeNp;
+    }
+    return safeNp;
 }
 
 static bool reorderInt4WeightForHmx(uint8_t* dst, size_t dstBytes, const uint8_t* rawInt4Data, const float* rawAlphaData,
@@ -714,7 +739,12 @@ ErrorCode HexagonConvolution::onBuildCmd(const std::vector<Tensor *> &inputs, co
     const int avail_size = vtcmSize - 4 * 1024 - 256;
     Q4ScaleMode q4ScaleMode = Q4ScaleMode::None;
     if (!mUseIm2Col && mResource != nullptr && mResource->useInt4W4A16) {
-        q4ScaleMode = mResource->int4ScaleBlockNum > 1 ? Q4ScaleMode::Block : Q4ScaleMode::PerOutput;
+        if (mResource->int4ScaleBlockNum > 1) {
+            q4ScaleMode = mResource->int4ScaleAsymmetric ? Q4ScaleMode::BlockAsymmetric
+                                                         : Q4ScaleMode::BlockSymmetric;
+        } else {
+            q4ScaleMode = Q4ScaleMode::PerOutput;
+        }
     }
     const bool useInt8Staging = mUseIm2Col && mResource != nullptr && mResource->useInt8W8A16;
     HexagonTileShape tile = mUseIm2Col ? chooseIm2ColTileShape(total_mp, total_np, KAlign, avail_size,

@@ -105,10 +105,13 @@ int createRequest(const char *path) {
   return 0;
 }
 
-int createAsymmetricRequest(const char *path, const char *referencePath, uint32_t m) {
-  constexpr uint32_t k = 64;
+int createAsymmetricRequest(const char *path, const char *referencePath, uint32_t m, uint32_t k) {
   constexpr uint32_t n = 32;
-  constexpr uint32_t scaleBlocks = 2;
+  if (k == 0 || (k % 64) != 0) {
+    fprintf(stderr, "Asymmetric Q4 K must be a positive multiple of 64, got %u\n", k);
+    return 1;
+  }
+  const uint32_t scaleBlocks = k / 64;
   const uint32_t activationBytes = m * k * sizeof(uint16_t);
   const uint32_t packedWeightBytes = k * n / 2;
   const uint32_t scaleBytes = n * scaleBlocks * 2 * 2 * sizeof(uint16_t);
@@ -187,7 +190,7 @@ int createAsymmetricRequest(const char *path, const char *referencePath, uint32_
       scaleData[block * 128 + 64 + 2 * o] = floatToFp16(offset);
       scaleData[block * 128 + 64 + 2 * o + 1] = floatToFp16(offset);
       for (uint32_t row = 0; row < m; ++row) {
-        for (uint32_t ki = block * 32; ki < (block + 1) * 32; ++ki) {
+        for (uint32_t ki = block * 64; ki < (block + 1) * 64; ++ki) {
           reference[row * 64 + o] += activationFloat[row * k + ki] *
                                      (logicalWeight[o * k + ki] * scale + offset);
         }
@@ -204,7 +207,7 @@ int createAsymmetricRequest(const char *path, const char *referencePath, uint32_
     DSPCOMMAND::CreateTensor(builder, 204, 0, outputBytes)
   };
   const int32_t params[] = { static_cast<int32_t>(m), static_cast<int32_t>(k), static_cast<int32_t>(n),
-                             0, 1, 1, 1, 2, static_cast<int32_t>(scaleBlocks), 1 };
+                             0, 1, 1, 1, static_cast<int32_t>(k / 32), static_cast<int32_t>(scaleBlocks), 1 };
   auto command = DSPCOMMAND::CreateCommand(builder, 34, builder.CreateVector(inputs), builder.CreateVector(outputs),
                                            builder.CreateVector(params, 10));
   builder.Finish(command);
@@ -538,10 +541,13 @@ int main(int argc, char **argv) {
     return createW8BlockRequest(argv[2], argv[3], 1, 2, true);
   }
   if (argc == 4 && strcmp(argv[1], "create-asymmetric") == 0) {
-    return createAsymmetricRequest(argv[2], argv[3], 64);
+    return createAsymmetricRequest(argv[2], argv[3], 64, 64);
   }
   if (argc == 4 && strcmp(argv[1], "create-asymmetric-m1") == 0) {
-    return createAsymmetricRequest(argv[2], argv[3], 1);
+    return createAsymmetricRequest(argv[2], argv[3], 1, 64);
+  }
+  if (argc == 5 && strcmp(argv[1], "create-asymmetric-m1-k") == 0) {
+    return createAsymmetricRequest(argv[2], argv[3], 1, static_cast<uint32_t>(strtoul(argv[4], nullptr, 10)));
   }
   if (argc == 4 && strcmp(argv[1], "verify-reference") == 0) {
     return verifyReference(argv[2], argv[3]);
@@ -549,7 +555,7 @@ int main(int argc, char **argv) {
   if (argc != 3) {
     fprintf(stderr,
             "Usage: %s create|verify|inspect FILE | create-asymmetric REQUEST REFERENCE | "
-            "create-asymmetric-m1 REQUEST REFERENCE | "
+            "create-asymmetric-m1 REQUEST REFERENCE | create-asymmetric-m1-k REQUEST REFERENCE K | "
             "verify-reference RESPONSE REFERENCE\n",
             argv[0]);
     return 64;
