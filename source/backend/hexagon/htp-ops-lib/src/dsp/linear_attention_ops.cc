@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "attention_private.hpp"
+#include "dsp/pwl.h"
 
 namespace {
 
@@ -198,13 +199,8 @@ static void linear_attention_convolution_range(const LinearAttentionConvTask *ta
       sum            = Q6_Vhf_vmpyacc_VhfVhfVhf(sum, x1, weights[1]);
       sum            = Q6_Vhf_vmpyacc_VhfVhfVhf(sum, x2, weights[2]);
       sum            = Q6_Vhf_vmpyacc_VhfVhfVhf(sum, x3, weights[3]);
-      _Alignas(128) __fp16 sums[64];
-      vmem(sums) = sum;
-      for (int lane = 0; lane < 64; ++lane) {
-        const float value = (float) sums[lane];
-        output[(size_t) (task->b * task->sequence + task->t) * task->conv_dim + d + lane] =
-          (__fp16)(value / (1.0f + expf(-value)));
-      }
+      const HVX_Vector activated = htp_ops_silu_pwl_fp16_vec(sum);
+      vmemu(output + (size_t) (task->b * task->sequence + task->t) * task->conv_dim + d) = activated;
       vmemu(state + d)                      = x1;
       vmemu(state + task->conv_dim + d)     = x2;
       vmemu(state + 2 * task->conv_dim + d) = x3;
