@@ -184,6 +184,91 @@ int verifyReference(const char *responsePath, const char *referencePath) {
   return bad == 0 && nonFinite == 0 && rmsError <= rmsTolerance ? 0 : 11;
 }
 
+int verifyFp16Reference(const char *responsePath, const char *referencePath, bool unpackQwen35State) {
+  std::ifstream            response(responsePath, std::ios::binary);
+  OfflineRpcResponseHeader header = {};
+  response.read(reinterpret_cast<char *>(&header), sizeof(header));
+  if (!response || header.magic != kOfflineRpcResponseMagic || header.version != kOfflineRpcVersion ||
+      header.status != 0 || (header.outputBytes % sizeof(uint16_t)) != 0) {
+    return 12;
+  }
+  std::vector<uint16_t> actual(header.outputBytes / sizeof(uint16_t));
+  response.read(reinterpret_cast<char *>(actual.data()), header.outputBytes);
+  std::ifstream reference(referencePath, std::ios::binary | std::ios::ate);
+  if (!response || !reference || reference.tellg() != static_cast<std::streamoff>(header.outputBytes)) {
+    return 13;
+  }
+  reference.seekg(0);
+  std::vector<uint16_t> expected(actual.size());
+  reference.read(reinterpret_cast<char *>(expected.data()), header.outputBytes);
+  if (unpackQwen35State) {
+    constexpr int heads  = 16;
+    constexpr int rows   = 128;
+    constexpr int cols   = 128;
+    constexpr int kTiles = rows / 32;
+    if (actual.size() != (size_t) heads * rows * cols) {
+      return 15;
+    }
+    std::vector<uint16_t> logical(actual.size());
+    for (int head = 0; head < heads; ++head) {
+      const size_t headBase = (size_t) head * rows * cols;
+      for (int row = 0; row < rows; ++row) {
+        const int kt = row / 32;
+        for (int col = 0; col < cols; ++col) {
+          const int    nt     = col / 32;
+          const size_t packed = ((size_t) nt * kTiles + kt) * 1024 + ((row & 31) / 2) * 64 + (col & 31) * 2 + (row & 1);
+          logical[headBase + (size_t) row * cols + col] = actual[headBase + packed];
+        }
+      }
+    }
+    actual.swap(logical);
+  }
+  uint32_t    bad              = 0;
+  uint32_t    nonFinite        = 0;
+  float       maxError         = 0.0f;
+  size_t      maxErrorIndex    = 0;
+  double      squaredError     = 0.0;
+  double      squaredExpected  = 0.0;
+  double      dot              = 0.0;
+  double      squaredActual    = 0.0;
+  const char *absToleranceText = getenv("MNN_OFFLINE_RPC_ABS_TOLERANCE");
+  const char *rmsToleranceText = getenv("MNN_OFFLINE_RPC_RMS_TOLERANCE");
+  const float absTolerance     = absToleranceText != nullptr ? strtof(absToleranceText, nullptr) : 0.001f;
+  const float rmsTolerance     = rmsToleranceText != nullptr ? strtof(rmsToleranceText, nullptr) : INFINITY;
+  for (size_t i = 0; i < actual.size(); ++i) {
+    const float actualValue   = fp16ToFloat(actual[i]);
+    const float expectedValue = fp16ToFloat(expected[i]);
+    if (!std::isfinite(actualValue) || !std::isfinite(expectedValue)) {
+      ++nonFinite;
+      ++bad;
+      continue;
+    }
+    const float error = std::fabs(actualValue - expectedValue);
+    squaredError += static_cast<double>(error) * error;
+    squaredExpected += static_cast<double>(expectedValue) * expectedValue;
+    squaredActual += static_cast<double>(actualValue) * actualValue;
+    dot += static_cast<double>(actualValue) * expectedValue;
+    if (error > maxError) {
+      maxError      = error;
+      maxErrorIndex = i;
+    }
+    if (error > absTolerance) {
+      ++bad;
+    }
+  }
+  const double rmsError = std::sqrt(squaredError / actual.size());
+  const double nrmse    = squaredExpected > 0.0 ? std::sqrt(squaredError / squaredExpected) : 0.0;
+  const double cosine =
+    squaredActual > 0.0 && squaredExpected > 0.0 ? dot / std::sqrt(squaredActual * squaredExpected) : 1.0;
+  printf(
+    "offline_rpc_host: FP16 reference compared elements=%zu bad=%u abs_tolerance=%g non_finite=%u "
+    "max_error=%g max_index=%zu rms_error=%g rms_tolerance=%g nrmse=%g cosine=%.12g "
+    "pcycles=%llu qtimer_ticks=%llu\n",
+    actual.size(), bad, absTolerance, nonFinite, maxError, maxErrorIndex, rmsError, rmsTolerance, nrmse, cosine,
+    static_cast<unsigned long long>(header.averageCycles), static_cast<unsigned long long>(header.averageTicks));
+  return bad == 0 && nonFinite == 0 && rmsError <= rmsTolerance ? 0 : 14;
+}
+
 int inspectRequest(const char *path) {
   std::ifstream           input(path, std::ios::binary);
   OfflineRpcRequestHeader header = {};
@@ -255,6 +340,12 @@ int inspectRequest(const char *path) {
 int main(int argc, char **argv) {
   if (argc == 4 && strcmp(argv[1], "verify-reference") == 0) {
     return verifyReference(argv[2], argv[3]);
+  }
+  if (argc == 4 && strcmp(argv[1], "verify-fp16-reference") == 0) {
+    return verifyFp16Reference(argv[2], argv[3], false);
+  }
+  if (argc == 4 && strcmp(argv[1], "verify-qwen35-packed-state") == 0) {
+    return verifyFp16Reference(argv[2], argv[3], true);
   }
   if (argc != 3) {
     fprintf(stderr, "Usage: %s create|verify|inspect FILE | verify-reference RESPONSE REFERENCE\n", argv[0]);
