@@ -20,6 +20,11 @@ static inline void store_fp16(uint8_t *data, int index, float value) {
   ((__fp16 *) data)[index] = (__fp16) value;
 }
 
+static inline int32_t fp32_bits(float value) {
+  union { float f; int32_t i; } bits = { .f = value };
+  return bits.i;
+}
+
 static inline float load_sequence(const uint8_t *data, int b, int d, int t, int batch, int channels, int sequence,
                                   int c4, int pack) {
   const int index = c4 ? c4_offset(b * sequence + t, d, batch * sequence, pack) : (b * channels + d) * sequence + t;
@@ -341,9 +346,9 @@ static void linear_attention_head_range(const LinearAttentionHeadTask *task) {
     _Alignas(128) __fp16 delta_values[256];
     const bool hvx_delta_output = use_hmx && task->output_c4 && (task->head_v_dim & 63) == 0;
     if (hvx_delta_output) {
-      const HVX_Vector v_decay = Q6_V_vsplat_R(*(const int *) &decay);
-      const HVX_Vector v_beta  = Q6_V_vsplat_R(*(const int *) &beta_value);
-      const HVX_Vector v_dot   = Q6_V_vsplat_R(*(const int *) &dot);
+      const HVX_Vector v_decay = Q6_V_vsplat_R(fp32_bits(decay));
+      const HVX_Vector v_beta  = Q6_V_vsplat_R(fp32_bits(beta_value));
+      const HVX_Vector v_dot   = Q6_V_vsplat_R(fp32_bits(dot));
       const int token = (task->b * task->sequence + task->t) * task->num_v_heads + h;
       for (int j = 0; j < task->head_v_dim; j += 64) {
         const int v_index = (task->b * task->sequence + task->t) * task->conv_dim + 2 * key_dim +
