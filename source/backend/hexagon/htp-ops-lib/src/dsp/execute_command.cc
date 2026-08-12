@@ -119,7 +119,7 @@ extern AEEResult htp_ops_lstm(uint8_t* y, uint8_t* yh, uint8_t* yc, const uint8_
 
 extern AEEResult htp_ops_linear_attention_gated_delta(
     uint8_t* output, uint8_t* convOutput, const uint8_t* qkv, const uint8_t* gate, const uint8_t* beta,
-    const uint8_t* convWeight, uint8_t* convState, uint8_t* recurrentState,
+    const uint8_t* convWeight, uint8_t* convState, uint8_t* recurrentState, uint8_t* packedConvWeight,
     int32 batch, int32 convDim, int32 seqLen, int32 numKHeads, int32 numVHeads,
     int32 headKDim, int32 headVDim, int32 convKernel, int32 qkvC4, int32 gateC4,
     int32 betaC4, int32 outputC4, int32 weightC4, int32 useQKL2Norm, int32 c4Pack);
@@ -635,13 +635,13 @@ int htp_execute_command(MmapManager* mmap_manager, const DSPCOMMAND::Command* co
             break;
         }
         case DSP_OP_LINEAR_ATTENTION_GATED_DELTA: {
-            if (inputs->size() != 6 || outputs->size() != 4) {
+            if (inputs->size() != 7 || outputs->size() != 4) {
                 ret = AEE_EBADPARM;
                 break;
             }
             ret = htp_ops_linear_attention_gated_delta(
                 mapped_ptrs[inputs->size()], mapped_ptrs[inputs->size() + 3], mapped_ptrs[0], mapped_ptrs[1],
-                mapped_ptrs[2], mapped_ptrs[3], mapped_ptrs[4], mapped_ptrs[5], intParams[0], intParams[1],
+                mapped_ptrs[2], mapped_ptrs[3], mapped_ptrs[4], mapped_ptrs[5], mapped_ptrs[6], intParams[0], intParams[1],
                 intParams[2], intParams[3], intParams[4], intParams[5], intParams[6], intParams[7],
                 intParams[8], intParams[9], intParams[10], intParams[11], intParams[12], intParams[13], intParams[14]);
             break;

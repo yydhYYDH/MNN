@@ -13,8 +13,10 @@ namespace MNN {
 struct HexagonLinearAttention::State {
     std::shared_ptr<Tensor> conv;
     std::shared_ptr<Tensor> recurrent;
+    std::shared_ptr<Tensor> packedConvWeight;
     size_t convBytes = 0;
     size_t recurrentBytes = 0;
+    size_t packedConvWeightBytes = 0;
     Backend* backend = nullptr;
 
     ~State() {
@@ -26,6 +28,9 @@ struct HexagonLinearAttention::State {
         }
         if (recurrent != nullptr) {
             backend->onReleaseBuffer(recurrent.get(), Backend::STATIC);
+        }
+        if (packedConvWeight != nullptr) {
+            backend->onReleaseBuffer(packedConvWeight.get(), Backend::STATIC);
         }
     }
 };
@@ -148,6 +153,24 @@ ErrorCode HexagonLinearAttention::onBuildCmd(const std::vector<Tensor*>& inputs,
     mOutputC4 = isC4(outputs[0]);
     mWeightC4 = isC4(inputs[3]);
 
+    constexpr size_t kPackedConvWeightHeaderBytes = 128;
+    const size_t packedBytes = kPackedConvWeightHeaderBytes + (size_t)mConvDim * mConvKernel * sizeof(uint16_t);
+    if (mState->packedConvWeight == nullptr || mState->packedConvWeightBytes != packedBytes) {
+        if (mState->packedConvWeight != nullptr) {
+            backend()->onReleaseBuffer(mState->packedConvWeight.get(), Backend::STATIC);
+            mState->packedConvWeight.reset();
+        }
+        mState->backend = backend();
+        mState->packedConvWeight.reset(Tensor::createDevice<int8_t>({(int)packedBytes}));
+        if (!backend()->onAcquireBuffer(mState->packedConvWeight.get(), Backend::STATIC)) {
+            mState->packedConvWeight.reset();
+            mValid = false;
+            return OUT_OF_MEMORY;
+        }
+        ::memset(HexagonBackend::getPtr(mState->packedConvWeight.get()), 0, packedBytes);
+        mState->packedConvWeightBytes = packedBytes;
+    }
+
     constexpr size_t kFp16Bytes = 2;
     const size_t convBytes = (size_t)mBatch * mConvDim * (mConvKernel - 1) * kFp16Bytes;
     const size_t recurrentBytes = (size_t)mBatch * mNumVHeads * mHeadKDim * mHeadVDim * kFp16Bytes;
@@ -187,16 +210,18 @@ ErrorCode HexagonLinearAttention::onBuildCmd(const std::vector<Tensor*>& inputs,
 
     int params[] = {mBatch,          mConvDim,          mSequence,         mNumKHeads,           mNumVHeads,
                     mHeadKDim,       mHeadVDim,         mConvKernel,       mQKVC4 ? 1 : 0,       mGateC4 ? 1 : 0,
-                    mBetaC4 ? 1 : 0, mOutputC4 ? 1 : 0, mWeightC4 ? 1 : 0, mUseQKL2Norm ? 1 : 0, mPack};
+                    mBetaC4 ? 1 : 0, mOutputC4 ? 1 : 0, mWeightC4 ? 1 : 0,
+                    mUseQKL2Norm ? 1 : 0, mPack};
     std::vector<std::pair<int, int>> inputFds = {
         HexagonBackend::getDevicePtr(inputs[0]),          HexagonBackend::getDevicePtr(inputs[1]),
         HexagonBackend::getDevicePtr(inputs[2]),          HexagonBackend::getDevicePtr(inputs[3]),
-        HexagonBackend::getDevicePtr(mState->conv.get()), HexagonBackend::getDevicePtr(mState->recurrent.get())};
+        HexagonBackend::getDevicePtr(mState->conv.get()), HexagonBackend::getDevicePtr(mState->recurrent.get()),
+        HexagonBackend::getDevicePtr(mState->packedConvWeight.get())};
     std::vector<std::pair<int, int>> outputFds = {
         HexagonBackend::getDevicePtr(outputs[0]), HexagonBackend::getDevicePtr(mState->conv.get()),
         HexagonBackend::getDevicePtr(mState->recurrent.get()), HexagonBackend::getDevicePtr(mConvScratch.get())};
-    std::vector<Tensor*> commandInputs = {inputs[0], inputs[1],          inputs[2],
-                                          inputs[3], mState->conv.get(), mState->recurrent.get()};
+    std::vector<Tensor*> commandInputs = {inputs[0], inputs[1], inputs[2], inputs[3], mState->conv.get(),
+                                          mState->recurrent.get(), mState->packedConvWeight.get()};
     std::vector<Tensor*> commandOutputs = {outputs[0], mState->conv.get(), mState->recurrent.get(), mConvScratch.get()};
     dst.emplace_back();
     dst.back().build(static_cast<HexagonBackend*>(backend()), DSP_OP_LINEAR_ATTENTION_GATED_DELTA, params,

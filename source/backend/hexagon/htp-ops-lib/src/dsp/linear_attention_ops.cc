@@ -423,12 +423,14 @@ static void linear_attention_heads_token(const LinearAttentionHeadTask &base) {
 
 extern "C" AEEResult htp_ops_linear_attention_gated_delta(
   uint8_t *output, uint8_t *conv_output, const uint8_t *qkv, const uint8_t *gate, const uint8_t *beta,
-  const uint8_t *conv_weight, uint8_t *conv_state, uint8_t *recurrent_state, int32_t batch, int32_t conv_dim,
+  const uint8_t *conv_weight, uint8_t *conv_state, uint8_t *recurrent_state, uint8_t *packed_conv_weight,
+  int32_t batch, int32_t conv_dim,
   int32_t sequence, int32_t num_k_heads, int32_t num_v_heads, int32_t head_k_dim, int32_t head_v_dim,
   int32_t conv_kernel, int32_t qkv_c4, int32_t gate_c4, int32_t beta_c4, int32_t output_c4, int32_t weight_c4,
   int32_t use_qk_l2norm, int32_t c4_pack) {
   if (output == nullptr || conv_output == nullptr || qkv == nullptr || gate == nullptr || beta == nullptr ||
-      conv_weight == nullptr || conv_state == nullptr || recurrent_state == nullptr || batch <= 0 || conv_dim <= 0 ||
+      conv_weight == nullptr || conv_state == nullptr || recurrent_state == nullptr || packed_conv_weight == nullptr ||
+      batch <= 0 || conv_dim <= 0 ||
       sequence <= 0 || num_k_heads <= 0 || num_v_heads <= 0 || head_k_dim <= 0 || head_v_dim <= 0 || conv_kernel <= 0 ||
       head_k_dim > 256 || head_v_dim > 256 || num_v_heads % num_k_heads != 0 || c4_pack <= 0) {
     return AEE_EBADPARM;
@@ -439,10 +441,31 @@ extern "C" AEEResult htp_ops_linear_attention_gated_delta(
   if (conv_dim != 2 * key_dim + value_dim) {
     return AEE_EBADPARM;
   }
+  constexpr uint32_t kPackedConvWeightMagic = 0x4c415743;
+  constexpr int kPackedConvWeightHeaderBytes = 128;
+  const bool use_packed_conv_weight = batch == 1 && conv_kernel == 4 && c4_pack == 64 && (conv_dim & 63) == 0;
+  if (use_packed_conv_weight && ((uint32_t *) packed_conv_weight)[0] != kPackedConvWeightMagic) {
+    __fp16 *packed = (__fp16 *) (packed_conv_weight + kPackedConvWeightHeaderBytes);
+    const __fp16 *weight = (const __fp16 *) conv_weight;
+    for (int block = 0; block < conv_dim / 64; ++block) {
+      for (int tap = 0; tap < conv_kernel; ++tap) {
+        for (int lane = 0; lane < 64; ++lane) {
+          const int channel = block * 64 + lane;
+          const int src = weight_c4 ? c4_offset(tap, channel, conv_kernel, c4_pack)
+                                    : channel * conv_kernel + tap;
+          packed[((size_t) block * conv_kernel + tap) * 64 + lane] = weight[src];
+        }
+      }
+    }
+    ((uint32_t *) packed_conv_weight)[0] = kPackedConvWeightMagic;
+  }
+  const uint8_t *command_conv_weight = use_packed_conv_weight
+      ? packed_conv_weight + kPackedConvWeightHeaderBytes : conv_weight;
+  const int command_weight_c4 = use_packed_conv_weight ? 1 : weight_c4;
   for (int b = 0; b < batch; ++b) {
     for (int t = 0; t < sequence; ++t) {
-      linear_attention_convolution_token(conv_output, qkv, conv_weight, conv_state, b, t, batch, conv_dim, sequence,
-                                         conv_kernel, qkv_c4, weight_c4, c4_pack);
+      linear_attention_convolution_token(conv_output, qkv, command_conv_weight, conv_state, b, t, batch, conv_dim,
+                                         sequence, conv_kernel, qkv_c4, command_weight_c4, c4_pack);
 
       LinearAttentionHeadTask head_task = { output,      conv_output, gate,          beta,       recurrent_state,
                                             b,           t,           batch,         conv_dim,   sequence,
