@@ -25,6 +25,7 @@ if(MNN_OFFLINE_RPC_HOST_ONLY)
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../source
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../schema/current
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../include
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../3rd_party/half
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../3rd_party/flatbuffers/include)
         target_include_directories(mnn_htp_mnn_variable_dump PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../..
