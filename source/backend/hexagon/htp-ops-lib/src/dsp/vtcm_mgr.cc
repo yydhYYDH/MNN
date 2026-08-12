@@ -105,7 +105,6 @@ int vtcm_manager_acquire() {
     }
   }
 
-  vtcm_reserved_start = vtcm_base + vtcm_total_size;
   return 0;
 }
 

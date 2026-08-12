@@ -29,6 +29,8 @@
 #  define HTP_QATTN_PHASE_PROFILE 0
 #endif
 
+static qurt_mutex_t g_command_group_vtcm_mutex = QURT_MUTEX_INIT;
+
 extern "C" {
 
 extern AEEResult htp_ops_matmul_q4a16_fp16(uint8_t* output, uint8_t* activation, uint8_t* weight, uint8_t* bias,
@@ -875,15 +877,22 @@ static int command_size(const int* commands, int index) {
 class LocalVtcmGuard {
 public:
     explicit LocalVtcmGuard(int commandCount) {
-        if (commandCount <= 0 || vtcm_manager_is_acquired()) {
+        if (commandCount <= 0) {
             return;
         }
-        mStatus = vtcm_manager_acquire();
-        mAcquired = (mStatus == AEE_SUCCESS);
+        qurt_mutex_lock(&g_command_group_vtcm_mutex);
+        mLocked = true;
+        if (!vtcm_manager_is_acquired()) {
+            mStatus = vtcm_manager_acquire();
+            mAcquired = (mStatus == AEE_SUCCESS);
+        }
     }
     ~LocalVtcmGuard() {
         if (mAcquired) {
             vtcm_manager_release();
+        }
+        if (mLocked) {
+            qurt_mutex_unlock(&g_command_group_vtcm_mutex);
         }
     }
     int status() const {
@@ -892,6 +901,7 @@ public:
 private:
     int mStatus = AEE_SUCCESS;
     bool mAcquired = false;
+    bool mLocked = false;
 };
 
 AEEResult htp_ops_execute_command_group(remote_handle64 handle, int32 groupFd, int32 groupOffset, int32 count, int32 syncGroupFd, int32 syncGroupOffset, int32 syncGroupSize) {
