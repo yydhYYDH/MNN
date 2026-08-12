@@ -115,7 +115,7 @@ static inline bool linear_attention_uses_packed_state(int head_k_dim, int head_v
          (head_v_dim & 31) == 0;
 }
 
-static inline void linear_attention_hvx_update_packed_state(__fp16 *state, const float *k, const float *delta,
+static inline void linear_attention_hvx_update_packed_state(__fp16 *state, const float *k, const __fp16 *delta,
                                                             float decay, int head_k_dim, int head_v_dim) {
   const int        k_tiles = head_k_dim / 32;
   const int        n_tiles = head_v_dim / 32;
@@ -124,7 +124,7 @@ static inline void linear_attention_hvx_update_packed_state(__fp16 *state, const
   for (int nt = 0; nt < n_tiles; ++nt) {
     _Alignas(128) __fp16 delta_pair[64];
     for (int col = 0; col < 32; ++col) {
-      const __fp16 value      = (__fp16) delta[nt * 32 + col];
+      const __fp16 value      = delta[nt * 32 + col];
       delta_pair[col * 2]     = value;
       delta_pair[col * 2 + 1] = value;
     }
@@ -338,8 +338,40 @@ static void linear_attention_head_range(const LinearAttentionHeadTask *task) {
     const bool use_hmx      = linear_attention_hmx_matmul(hmx_products, qk_fp16, qk_fp16 + task->head_k_dim,
                                                           (const __fp16 *) task->recurrent_state + state_base,
                                                           task->head_k_dim, task->head_v_dim);
-    float      delta_values[256];
-    for (int j = 0; j < task->head_v_dim; ++j) {
+    _Alignas(128) __fp16 delta_values[256];
+    const bool hvx_delta_output = use_hmx && task->output_c4 && (task->head_v_dim & 63) == 0;
+    if (hvx_delta_output) {
+      const HVX_Vector v_decay = Q6_V_vsplat_R(*(const int *) &decay);
+      const HVX_Vector v_beta  = Q6_V_vsplat_R(*(const int *) &beta_value);
+      const HVX_Vector v_dot   = Q6_V_vsplat_R(*(const int *) &dot);
+      const int token = (task->b * task->sequence + task->t) * task->num_v_heads + h;
+      for (int j = 0; j < task->head_v_dim; j += 64) {
+        const int v_index = (task->b * task->sequence + task->t) * task->conv_dim + 2 * key_dim +
+                            h * task->head_v_dim + j;
+        const HVX_VectorPair v_value = Q6_Wsf_vcvt_Vhf(Q6_Vh_vshuff_Vh(
+          vmemu((const __fp16 *) task->conv_output + v_index)));
+        const HVX_VectorPair v_predicted = Q6_Wsf_vcvt_Vhf(Q6_Vh_vshuff_Vh(
+          vmemu(hmx_products + task->head_v_dim + j)));
+        const HVX_VectorPair v_queried = Q6_Wsf_vcvt_Vhf(Q6_Vh_vshuff_Vh(vmemu(hmx_products + j)));
+        HVX_Vector delta_sf[2];
+        HVX_Vector result_sf[2];
+        for (int half = 0; half < 2; ++half) {
+          const HVX_Vector value_sf = half ? Q6_V_hi_W(v_value) : Q6_V_lo_W(v_value);
+          const HVX_Vector predicted_sf = half ? Q6_V_hi_W(v_predicted) : Q6_V_lo_W(v_predicted);
+          const HVX_Vector queried_sf = half ? Q6_V_hi_W(v_queried) : Q6_V_lo_W(v_queried);
+          const HVX_Vector residual_sf = Q6_Vsf_vsub_VsfVsf(
+            value_sf, Q6_Vsf_vmpy_VsfVsf(v_decay, predicted_sf));
+          delta_sf[half] = Q6_Vsf_vmpy_VsfVsf(v_beta, residual_sf);
+          result_sf[half] = Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(v_decay, queried_sf),
+                                               Q6_Vsf_vmpy_VsfVsf(v_dot, delta_sf[half]));
+        }
+        const HVX_Vector v_delta = Q6_Vh_vdeal_Vh(Q6_Vhf_vcvt_VsfVsf(delta_sf[0], delta_sf[1]));
+        const HVX_Vector v_result = Q6_Vh_vdeal_Vh(Q6_Vhf_vcvt_VsfVsf(result_sf[0], result_sf[1]));
+        vmemu(delta_values + j) = v_delta;
+        vmemu((__fp16 *) task->output + c4_offset(token, j, task->batch * task->sequence * task->num_v_heads,
+                                                  task->c4_pack)) = v_result;
+      }
+    } else for (int j = 0; j < task->head_v_dim; ++j) {
       float predicted = use_hmx ? (float) hmx_products[task->head_v_dim + j] : 0.0f;
       float queried   = use_hmx ? (float) hmx_products[j] : 0.0f;
       if (!use_hmx) {
@@ -356,7 +388,7 @@ static void linear_attention_head_range(const LinearAttentionHeadTask *task) {
         (task->b * task->sequence + task->t) * task->conv_dim + 2 * key_dim + h * task->head_v_dim + j;
       const float value  = load_fp16(task->conv_output, v_index);
       const float delta  = beta_value * (value - decay * predicted);
-      delta_values[j]    = delta;
+      delta_values[j]    = (__fp16) delta;
       const float result = decay * queried + dot * delta;
       if (task->output_c4) {
         const int token = (task->b * task->sequence + task->t) * task->num_v_heads + h;
