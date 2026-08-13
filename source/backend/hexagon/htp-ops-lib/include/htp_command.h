@@ -78,6 +78,11 @@ enum DSPOpType {
     DSP_OP_MATMUL_Q4A16_GEMV_I8,
     DSP_OP_VISION_ATTENTION_FP16,
     DSP_OP_VISION_FLASH_ATTENTION_FP16,
+    // Keep this in the previously unused range so existing command ids stay stable.
+    DSP_OP_TOPKV2_FP16 = 53,
+    DSP_OP_TOPKV2_SCAN_PROFILE = 54,
+    DSP_OP_TOPKV2_OUTPUT_PROFILE = 55,
+    DSP_OP_TOPKV2_MERGE_PROFILE = 56,
     DSP_OP_COMMAND_GROUP = 99,
     DSP_OP_MAX = 100
 };
