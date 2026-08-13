@@ -8,6 +8,7 @@ static constexpr uint32_t kOfflineRpcVersion           = 4;
 static constexpr uint32_t kOfflineRpcPageBytes         = 4096;
 static constexpr uint32_t kOfflineRpcBufferOutput      = 1;
 static constexpr uint32_t kOfflineRpcVerifyMockMatMul  = 1;
+static constexpr uint32_t kOfflineRpcVerifyTopK        = 2;
 static constexpr uint32_t kOfflineRpcOutputFdIndex     = 1;
 static constexpr uint32_t kOfflineRpcOutputOffsetIndex = 2;
 static constexpr uint32_t kOfflineRpcOutputSizeIndex   = 3;
