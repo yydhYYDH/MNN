@@ -10,6 +10,10 @@
 
 namespace MNN {
 
+namespace {
+constexpr int32_t kMaxHexagonTopK = 64;
+}
+
 HexagonTopKV2::HexagonTopKV2(Backend* backend) : HexagonExecution(backend) {
 }
 
@@ -29,16 +33,16 @@ HexagonTopKV2* HexagonTopKV2::create(Backend* backend, const Op* op, const std::
         outputs[1]->getType().code != halide_type_int || outputs[1]->getType().bits != 32) {
         return nullptr;
     }
-    auto kPtr = inputs[1]->host<int32_t>();
-    if (kPtr == nullptr || kPtr[0] != 1) {
-        return nullptr;
-    }
     auto inputDes = TensorUtils::getDescribe(inputs[0]);
     auto valueDes = TensorUtils::getDescribe(outputs[0]);
     auto indexDes = TensorUtils::getDescribe(outputs[1]);
-    if (inputDes->dimensionFormat != MNN_DATA_FORMAT_NCHW ||
-        valueDes->dimensionFormat != MNN_DATA_FORMAT_NCHW ||
-        indexDes->dimensionFormat != MNN_DATA_FORMAT_NCHW) {
+    const auto isSupportedFormat = [](MNN_DATA_FORMAT format) {
+        return format == MNN_DATA_FORMAT_NCHW || format == MNN_DATA_FORMAT_NHWC ||
+               format == MNN_DATA_FORMAT_NC4HW4 || format == MNN_DATA_FORMAT_NHWC4 ||
+               format == MNN_DATA_FORMAT_UNKNOWN;
+    };
+    if (!isSupportedFormat(inputDes->dimensionFormat) || !isSupportedFormat(valueDes->dimensionFormat) ||
+        !isSupportedFormat(indexDes->dimensionFormat)) {
         return nullptr;
     }
     if (HexagonRuntime::getDstFunctions() == nullptr) {
@@ -64,13 +68,18 @@ ErrorCode HexagonTopKV2::onBuildCmd(const std::vector<Tensor*>& inputs, const st
         return NOT_SUPPORT;
     }
     const int rows = input->elementSize() / rowSize;
-    if (values->elementSize() != rows || indices->elementSize() != rows) {
+    if (rows <= 0 || values->elementSize() <= 0 || values->elementSize() % rows != 0 ||
+        indices->elementSize() != values->elementSize()) {
+        return NOT_SUPPORT;
+    }
+    const int k = values->elementSize() / rows;
+    if (k <= 0 || k > kMaxHexagonTopK || k > rowSize) {
         return NOT_SUPPORT;
     }
     const int inputBytes = HexagonBackend::getBytes(input);
     const int valueBytes = HexagonBackend::getBytes(values);
     const int indexBytes = HexagonBackend::getBytes(indices);
-    if (inputBytes != 2 || valueBytes != 2 || indexBytes != 4) {
+    if (inputBytes != 2 || (valueBytes != 2 && (valueBytes != 4 || k == 1)) || indexBytes != 4) {
         return NOT_SUPPORT;
     }
 
@@ -78,12 +87,14 @@ ErrorCode HexagonTopKV2::onBuildCmd(const std::vector<Tensor*>& inputs, const st
     auto valueDev = HexagonBackend::getDevicePtr(values);
     auto indexDev = HexagonBackend::getDevicePtr(indices);
 
-    int32_t params[2] = {rowSize, rows};
+    int32_t params[4] = {rowSize, rows, k, valueBytes};
     std::vector<std::pair<int, int>> inputFds = {inputDev};
     std::vector<std::pair<int, int>> outputFds = {valueDev, indexDev};
 
     dst.emplace_back();
-    dst.back().build(static_cast<HexagonBackend*>(backend()), DSP_OP_TOPKV2_K1_FP16, params, sizeof(params),
+    const int opType = k == 1 ? DSP_OP_TOPKV2_K1_FP16 : DSP_OP_TOPKV2_FP16;
+    const size_t paramSize = k == 1 ? sizeof(int32_t) * 2 : sizeof(params);
+    dst.back().build(static_cast<HexagonBackend*>(backend()), opType, params, paramSize,
                      inputFds, outputFds, inputs, outputs);
     return NO_ERROR;
 }

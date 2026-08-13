@@ -102,7 +102,10 @@ extern AEEResult htp_ops_binary_elementwise(uint8_t* dst, uint8_t* src0, uint8_t
 extern AEEResult htp_ops_select(uint8_t* dst, uint8_t* cond, uint8_t* src1, uint8_t* src2, int32 outSize, int32 condSize, int32 in1Size, int32 in2Size, int32 bytes, int32 condBytes, int32 channelSize, int32 innerSize);
 extern AEEResult htp_ops_shared_gather(uint8_t* dst, uint8_t* indices, uint8_t* weight, int32 selectSize, int32 ic, int32 oc, int32 bytes, int32 isInt4);
 extern AEEResult htp_ops_zero(uint8_t* dst, int32 size);
-extern AEEResult htp_ops_topkv2_k1_fp16(uint8_t* values, uint8_t* indices, uint8_t* input, int32 rowSize, int32 rows);
+extern AEEResult htp_ops_topkv2_k1_fp16(uint8_t* values, uint8_t* indices, uint8_t* input, int32 rowSize, int32 rows,
+                                        int* profile);
+extern AEEResult htp_ops_topkv2_fp16(uint8_t* values, uint8_t* indices, uint8_t* input,
+                                     int32 rowSize, int32 rows, int32 k, int32 outputBytes, int* profile);
 extern AEEResult htp_ops_softmax(uint8_t* dst, const uint8_t* src, int32 outside, int32 channel, int32 inside, int32 bytes);
 extern AEEResult htp_ops_reduction(uint8_t* dst, const uint8_t* src, int32 outside, int32 reduce, int32 inside, int32 type, int32 bytes);
 extern AEEResult htp_ops_masked_reduction(uint8_t* dst, const uint8_t* src, const uint8_t* mask, int32 outside, int32 reduce, int32 inside, int32 type, int32 bytes);
@@ -174,7 +177,7 @@ static void sync_group_tensors(MmapManager* mmap_manager, int32 syncGroupFd, int
     }
 }
 
-int htp_execute_command(MmapManager* mmap_manager, const DSPCOMMAND::Command* command) {
+int htp_execute_command(MmapManager* mmap_manager, const DSPCOMMAND::Command* command, int* profile) {
     int32_t opType = command->type();
     auto inputs = command->inputs();
     auto outputs = command->outputs();
@@ -574,7 +577,13 @@ int htp_execute_command(MmapManager* mmap_manager, const DSPCOMMAND::Command* co
             ret = htp_ops_topkv2_k1_fp16(mapped_ptrs[inputs->size()],
                                          mapped_ptrs[inputs->size() + 1],
                                          mapped_ptrs[0],
-                                         intParams[0], intParams[1]);
+                                         intParams[0], intParams[1], profile);
+            break;
+        }
+        case DSP_OP_TOPKV2_FP16: {
+            ret = htp_ops_topkv2_fp16(mapped_ptrs[inputs->size()],
+                                      mapped_ptrs[inputs->size() + 1],
+                                      mapped_ptrs[0], intParams[0], intParams[1], intParams[2], intParams[3], profile);
             break;
         }
         case DSP_OP_SOFTMAX: {
@@ -741,7 +750,7 @@ int htp_ops_execute_offline_command(const uint8_t* commandData, const int* buffe
         }
     }
     if (result == AEE_SUCCESS) {
-        result = htp_execute_command(manager, flatbuffers::GetRoot<DSPCOMMAND::Command>(commandData));
+        result = htp_execute_command(manager, flatbuffers::GetRoot<DSPCOMMAND::Command>(commandData), nullptr);
     }
     mmap_manager_destroy_local(manager);
     return result;
@@ -771,7 +780,7 @@ static int execute_single_command(MmapManager* mmap_manager, int32 cmdFd, int32 
         start_time = HAP_perf_get_time_us();
     }
 
-    int ret = htp_execute_command(mmap_manager, command);
+    int ret = htp_execute_command(mmap_manager, command, profile);
 
     if (profile) {
         unsigned long long end_time = HAP_perf_get_time_us();
