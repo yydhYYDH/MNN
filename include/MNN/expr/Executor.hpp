@@ -159,6 +159,11 @@ public:
         friend class StaticModule;
         RuntimeManager();
     };
+
+    // Create an Express executor around an existing RuntimeManager. This is
+    // useful for temporary graphs that must use the same backend/runtime as a
+    // loaded Module (for example sampler-side TopK on device logits).
+    static std::shared_ptr<Executor> newExecutor(const std::shared_ptr<RuntimeManager>& runtimeManager);
     static bool getComputeInfo(EXPRP expr, Interpreter::SessionInfoCode code, void* ptr);
 #ifndef MNN_REDUCE_SIZE
     std::map<std::string, std::shared_ptr<SubGraph>>& subgraph() {
@@ -166,6 +171,8 @@ public:
     };
 #endif
 private:
+    Executor(const RuntimeInfo& runtime, MNNForwardType type, int numberThread, const BackendConfig& config,
+             const std::string& externalFile);
     std::shared_ptr<Runtime> _getOrCreateRuntime(MNNForwardType type, const BackendConfig* config, int numberThread, bool reset = true);
     Executor(std::shared_ptr<Runtime> backend, MNNForwardType type, int numberThread);
     void _makeCache(const std::vector<EXPRP>& outputs, bool forceCPU);

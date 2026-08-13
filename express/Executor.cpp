@@ -104,6 +104,33 @@ Executor::Executor(std::shared_ptr<Runtime> runtime, MNNForwardType type, int nu
     std::shared_ptr<Backend> defaultBackend(mRuntimeInfo.second->onCreate(&defaultConfig));
     mAttr->constantBackend = defaultBackend;
 }
+
+Executor::Executor(const RuntimeInfo& runtime, MNNForwardType type, int numberThread, const BackendConfig& config,
+                   const std::string& externalFile)
+    : mRuntimeInfo(runtime) {
+    mAttr.reset(new ExecutorAttr);
+    mAttr->firstType = type;
+    mAttr->numThread = numberThread;
+    mAttr->config = config;
+    mAttr->config.sharedContext = nullptr;
+    mAttr->externalFile = externalFile;
+    mDebug.reset(new DebugTools);
+    BackendConfig defaultConfig;
+    defaultConfig.flags = 4;
+    mAttr->constantBackend.reset(mRuntimeInfo.second->onCreate(&defaultConfig));
+}
+
+std::shared_ptr<Executor> Executor::newExecutor(const std::shared_ptr<RuntimeManager>& runtimeManager) {
+    if (runtimeManager == nullptr || runtimeManager->getInside() == nullptr ||
+        runtimeManager->getInside()->mRuntime.first.empty()) {
+        return nullptr;
+    }
+    const auto* inside = runtimeManager->getInside();
+    return std::shared_ptr<Executor>(new Executor(
+        inside->mRuntime, inside->mRuntime.first.begin()->first, inside->mContent->mNumberThread,
+        inside->mContent->mConfig, inside->mContent->mExternalFile));
+}
+
 Executor::~Executor(){
     // Do nothing
 }
