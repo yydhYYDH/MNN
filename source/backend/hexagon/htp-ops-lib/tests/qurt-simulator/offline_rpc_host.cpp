@@ -15,6 +15,9 @@
 namespace {
 
 constexpr uint32_t kSize = 32;
+constexpr uint32_t kTopKRowSize = 4097;
+constexpr uint32_t kTopKRows = 2;
+constexpr uint32_t kTopK = 40;
 
 bool writeBytes(std::ofstream &output, const void *data, size_t size) {
   output.write(static_cast<const char *>(data), size);
@@ -81,6 +84,86 @@ int createRequest(const char *path) {
   printf("offline_rpc_host: request=%s m=%u k=%u n=%u bytes=%u\n", path, kSize, kSize, kSize,
          static_cast<unsigned>(sizeof(header) + sizeof(buffers) + sizeof(commandDesc) + builder.GetSize() +
                                activationBytes + weightBytes + vectorBytes + outputBytes));
+  return 0;
+}
+
+uint16_t floatToFp16(float value) {
+  uint32_t bits = 0;
+  memcpy(&bits, &value, sizeof(bits));
+  const uint32_t sign = (bits >> 16) & 0x8000U;
+  const int32_t exponent = static_cast<int32_t>((bits >> 23) & 0xffU) - 127 + 15;
+  const uint32_t mantissa = bits & 0x7fffffU;
+  if (exponent <= 0) return static_cast<uint16_t>(sign);
+  if (exponent >= 31) return static_cast<uint16_t>(sign | 0x7c00U);
+  return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exponent) << 10) | (mantissa >> 13));
+}
+
+int createTopKRequest(const char *path) {
+  const uint32_t inputBytes = kTopKRowSize * kTopKRows * sizeof(uint16_t);
+  const uint32_t valueBytes = kTopK * kTopKRows * sizeof(uint16_t);
+  const uint32_t indexBytes = kTopK * kTopKRows * sizeof(int32_t);
+  const uint32_t expectedBytes = valueBytes + indexBytes;
+  const OfflineRpcBufferDesc buffers[] = {
+    {201, inputBytes, 128, 0, 1}, {202, valueBytes, 128, kOfflineRpcBufferOutput, 1},
+    {203, indexBytes, 128, kOfflineRpcBufferOutput, 1}, {204, expectedBytes, 128, 0, 1}
+  };
+  std::vector<uint16_t> input(kTopKRowSize * kTopKRows);
+  std::vector<uint16_t> expectedValues(kTopK * kTopKRows);
+  std::vector<int32_t> expectedIndices(kTopK * kTopKRows);
+  for (uint32_t row = 0; row < kTopKRows; ++row) {
+    std::vector<std::pair<float, int32_t>> ranked;
+    ranked.reserve(kTopKRowSize);
+    for (uint32_t col = 0; col < kTopKRowSize; ++col) {
+      const float value = static_cast<float>((col * 17 + row * 13) % 101) / 10.0f - 5.0f;
+      input[row * kTopKRowSize + col] = floatToFp16(value);
+      ranked.emplace_back(value, static_cast<int32_t>(col));
+    }
+    std::stable_sort(ranked.begin(), ranked.end(), [](const auto &a, const auto &b) {
+      if (a.first != b.first) return a.first > b.first;
+      return a.second < b.second;
+    });
+    for (uint32_t i = 0; i < kTopK; ++i) {
+      expectedValues[row * kTopK + i] = floatToFp16(ranked[i].first);
+      expectedIndices[row * kTopK + i] = ranked[i].second;
+    }
+  }
+  std::vector<uint8_t> expected(expectedBytes, 0);
+  memcpy(expected.data(), expectedValues.data(), valueBytes);
+  memcpy(expected.data() + valueBytes, expectedIndices.data(), indexBytes);
+  std::vector<uint16_t> outputValues(kTopK * kTopKRows, 0);
+  std::vector<int32_t> outputIndices(kTopK * kTopKRows, 0);
+
+  flatbuffers::FlatBufferBuilder builder;
+  std::vector<flatbuffers::Offset<DSPCOMMAND::Tensor>> inputs = {
+    DSPCOMMAND::CreateTensor(builder, 201, 0, inputBytes)
+  };
+  std::vector<flatbuffers::Offset<DSPCOMMAND::Tensor>> outputs = {
+    DSPCOMMAND::CreateTensor(builder, 202, 0, valueBytes),
+    DSPCOMMAND::CreateTensor(builder, 203, 0, indexBytes)
+  };
+  const int32_t params[] = {static_cast<int32_t>(kTopKRowSize), static_cast<int32_t>(kTopKRows),
+                            static_cast<int32_t>(kTopK), 2};
+  auto command = DSPCOMMAND::CreateCommand(builder, 53, builder.CreateVector(inputs), builder.CreateVector(outputs),
+                                           builder.CreateVector(params, 4));
+  builder.Finish(command);
+  OfflineRpcRequestHeader header = {
+    kOfflineRpcRequestMagic, kOfflineRpcVersion, 4, 1,
+    {kOfflineRpcVerifyTopK, 202, 0, valueBytes, 203, indexBytes}
+  };
+  OfflineRpcCommandDesc commandDesc = {static_cast<uint32_t>(builder.GetSize()), 0};
+  const OfflineRpcChunkDesc chunks[] = {{0, inputBytes}, {0, valueBytes}, {0, indexBytes}, {0, expectedBytes}};
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  if (!output || !writeBytes(output, &header, sizeof(header)) || !writeBytes(output, buffers, sizeof(buffers)) ||
+      !writeBytes(output, &commandDesc, sizeof(commandDesc)) ||
+      !writeBytes(output, builder.GetBufferPointer(), builder.GetSize()) ||
+      !writeBytes(output, &chunks[0], sizeof(chunks[0])) || !writeBytes(output, input.data(), inputBytes) ||
+      !writeBytes(output, &chunks[1], sizeof(chunks[1])) || !writeBytes(output, outputValues.data(), valueBytes) ||
+      !writeBytes(output, &chunks[2], sizeof(chunks[2])) || !writeBytes(output, outputIndices.data(), indexBytes) ||
+      !writeBytes(output, &chunks[3], sizeof(chunks[3])) || !writeBytes(output, expected.data(), expectedBytes)) {
+    fprintf(stderr, "Unable to write TopK offline RPC request: %s\n", path);
+    return 1;
+  }
+  printf("offline_rpc_host: TopK request=%s rowSize=%u rows=%u k=%u\n", path, kTopKRowSize, kTopKRows, kTopK);
   return 0;
 }
 
@@ -338,6 +421,9 @@ int inspectRequest(const char *path) {
 }  // namespace
 
 int main(int argc, char **argv) {
+  if (argc == 3 && strcmp(argv[1], "create-topk") == 0) {
+    return createTopKRequest(argv[2]);
+  }
   if (argc == 4 && strcmp(argv[1], "verify-reference") == 0) {
     return verifyReference(argv[2], argv[3]);
   }

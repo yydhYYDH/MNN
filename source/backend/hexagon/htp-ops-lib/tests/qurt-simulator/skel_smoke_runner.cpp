@@ -62,6 +62,8 @@ static int runOfflineCommand() {
   int      ids[kMaxBuffers]       = {};
   void    *ptrs[kMaxBuffers]      = {};
   int      outputIndex            = -1;
+  int      indicesIndex           = -1;
+  int      expectedIndex          = -1;
   uint64   memalignTicks          = 0;
   uint64   memsetTicks            = 0;
   uint64   freadTicks             = 0;
@@ -129,6 +131,12 @@ static int runOfflineCommand() {
          descs[i].id == (int32_t) header.reserved[kOfflineRpcOutputFdIndex])) {
       outputIndex = i;
     }
+    if (descs[i].id == 203) {
+      indicesIndex = i;
+    }
+    if (descs[i].id == 204) {
+      expectedIndex = i;
+    }
   }
   printf(
     "offline_rpc_load: complete logical_bytes=%llu stored_bytes=%llu chunks=%llu memalign_ticks=%llu "
@@ -159,9 +167,10 @@ static int runOfflineCommand() {
   uint64     totalTicks       = 0;
   int        err              = 0;
   const bool verifyMockMatMul = header.reserved[0] == kOfflineRpcVerifyMockMatMul;
+  const bool verifyTopK        = header.reserved[0] == kOfflineRpcVerifyTopK;
   const int  runCount         = verifyMockMatMul ? kMeasuredRuns : 1;
   for (int run = 0; run < runCount; ++run) {
-    if (verifyMockMatMul) {
+    if (verifyMockMatMul || verifyTopK) {
       memset((uint8_t *) ptrs[outputIndex] + outputOffset, 0, outputBytes);
     }
     uint64 tickStart  = HAP_perf_get_qtimer_count();
@@ -186,6 +195,25 @@ static int runOfflineCommand() {
     for (int row = 0; err == 0 && row < kSize; ++row) {
       for (int col = 0; col < kSize; ++col) {
         if (output[row * 64 + col] != 0x5000) {
+          ++bad;
+        }
+      }
+    }
+  }
+  if (verifyTopK) {
+    if (expectedIndex < 0 || indicesIndex < 0 || descs[expectedIndex].logicalSize < outputBytes + descs[indicesIndex].logicalSize) {
+      ++bad;
+    } else {
+      const uint8_t *actualValues = (const uint8_t *)output;
+      const uint8_t *actualIndices = (const uint8_t *)ptrs[indicesIndex];
+      const uint8_t *expected = (const uint8_t *)ptrs[expectedIndex];
+      for (uint32_t i = 0; i < outputBytes; ++i) {
+        if (actualValues[i] != expected[i]) {
+          ++bad;
+        }
+      }
+      for (uint32_t i = 0; i < descs[indicesIndex].logicalSize; ++i) {
+        if (actualIndices[i] != expected[outputBytes + i]) {
           ++bad;
         }
       }
