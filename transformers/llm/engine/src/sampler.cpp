@@ -240,16 +240,37 @@ void Sampler::buildPipeline() {
 
     // The device top-k prefilter is exact only when topK is the first
     // effective filter step: logit_bias / banned_tokens are applied before
-    // topK on CPU, and a leading penalty step must be a no-op.
+    // topK on CPU, and a leading penalty step must be a no-op. Additional
+    // filters after topK (topP / min_p / tfs / typical) must run on the full
+    // logits distribution, so the prefilter is only used when topK is the
+    // ONLY filter (plus temperature/greedy selection handled by stepSelect).
     if (mConfig.type == "mixed" && mConfig.topK > 0 && mConfig.logit_bias.empty() &&
         mConfig.banned_tokens.empty()) {
         const auto& ms = mConfig.mixedSamplers;
-        if (!ms.empty() && ms[0] == "topK") {
+        const auto onlyTopKThenSelect = [&ms]() {
+            for (const auto& name : ms) {
+                if (name != "topK" && name != "temperature" && name != "greedy") {
+                    return false;
+                }
+            }
+            return !ms.empty();
+        };
+        if (onlyTopKThenSelect()) {
             mGpuTopKPrefilter = true;
         } else if (ms.size() > 1 && ms[0] == "penalty" && ms[1] == "topK" &&
                    mConfig.repetition_penalty <= 1.0f && mConfig.presence_penalty <= 0.0f &&
                    mConfig.frequency_penalty <= 0.0f && mConfig.ngram_factor <= 1.0f) {
-            mGpuTopKPrefilter = true;
+            // penalty is a no-op here; the remaining filters after topK must
+            // still be only topK(+temperature/greedy) for the subset to be exact.
+            bool restOnlyTopK = true;
+            for (size_t i = 2; i < ms.size(); ++i) {
+                const auto& name = ms[i];
+                if (name != "topK" && name != "temperature" && name != "greedy") {
+                    restOnlyTopK = false;
+                    break;
+                }
+            }
+            mGpuTopKPrefilter = restOnlyTopK;
         }
     }
 }
@@ -268,8 +289,9 @@ int Sampler::sample(Express::VARP logits) {
     SamplerState state;
     if (mGpuTopKPrefilter && mConfig.topK < lastDim) {
         // Device-side top-k prefilter: TopKV2 on the device logits, then run
-        // the remaining pipeline steps on the k-sized subset. Equivalent to
-        // the CPU path because topK is the first effective filter step.
+        // the remaining pipeline steps on the k-sized subset. This is only
+        // enabled when topK is the only effective filter (see constructor),
+        // so the subset matches the CPU topK result.
         auto res = Express::_TopKV2(logits, Express::_Scalar<int>(mConfig.topK));
         auto valuePtr = res[0]->readMap<float>();
         auto indexPtr = res[1]->readMap<int>();

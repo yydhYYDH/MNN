@@ -190,6 +190,28 @@ description: MNN Hexagon/HVX/HMX DSP 后端（`source/backend/hexagon`）的优�
 - For HMX paths, verify VTCM allocation sizes, tile counts, and descriptor counts before widening a tile or block.
 - Do not assume a micro-optimization is portable across v79/v81; build and test the target architecture.
 
+### Numerical preservation
+
+- Preserve precision and operation association when results feed recurrent state. Do not accept an all-FP16 shortcut if
+  decode-token errors accumulate. Prefer FP32 HVX intermediates for delta/output where that preserves the scalar oracle.
+- Vectorize elementwise Q/K work but retain scalar reduction order when practical. Compare every prefill/decode step.
+- Do not add approximate vector nonlinear functions for a microkernel-only gain; require full-model improvement and a
+  predefined error envelope.
+### Persistent packed data
+
+- Do not read device/model weights in host `onBuildCmd` unless the upload/readback contract guarantees validity; an
+  all-zero packed weight can look like a successful build and create invalid timing.
+- For lazy packing, allocate and zero a STATIC buffer, pack after DSP input synchronization, and write a magic/header
+  marker after packing. Test first call, steady state, reset, cloned executions, and input/output mapping semantics.
+### VTCM and DMA
+
+- Treat VTCM as a hypothesis, not as a synonym for fast memory. Separate address space, copy-in/out, lease, layout,
+  and arithmetic variables. A mapped DDR buffer may already be cache-hot, and whole-state transfer can dominate.
+- Before VTCM, make ordinary mapped-memory accesses contiguous and vectorized. If state is truly DSP-owned, specify
+  reset, dump, resource-loss, and mirror-back semantics explicitly.
+- DMA completion does not prove cache visibility. Gate every DMA variant on the first logical output and all state
+  outputs; non-finite values, huge errors, or changed state trajectory invalidate timing. Prefer isolated DMA-owned
+  staging tiles with explicit alignment, cache clean/invalidate, and ownership transitions.
 ## QuRT Simulator Checks
 
 - Allocate buffers used by DSP DMA from aligned QuRT heap or mapped memory. Do not use writable sections of a
@@ -228,6 +250,26 @@ description: MNN Hexagon/HVX/HMX DSP 后端（`source/backend/hexagon`）的优�
   acceptance requires a real image prompt, meaningful generated text, both Vision and LLM Hexagon profile entries,
   and a negative scan for DSP/RPC/crash signatures. Keep a small CPU-reference Vision graph as the numerical gate.
 
+## Stateful acceptance matrix
+
+Verify each mutable output independently:
+
+- logical model output, typically with an FP32 verifier;
+- convolution state and recurrent state, with FP16-aware verification;
+- private layouts after logical unpacking, not raw-byte comparison.
+
+Report element count, tolerance, bad count, maximum error, RMS/NRMSE, cosine, non-finite count, and repeat determinism.
+Require at least:
+
+- T>1 prefill followed by repeated T=1 decode;
+- chunked versus one-shot prefill;
+- reset and repeated deterministic execution;
+- independent sessions; if shared VTCM or concurrency changes, genuinely concurrent sessions with a start barrier and
+  enough repetitions to expose deadlock, aliasing, and state leakage.
+
+Successful RPC or process exit is not enough: require the expected DSP op marker, selected architecture, complete
+outputs, and a clean crash/error scan. For packed layouts such as NC4HW4/pack64, compare logical order after unpacking;
+a reshape may require physical reorder rather than a byte copy.
 ## DSP DMA-BUF Memory Measurement
 
 用于验证 Hexagon/DSP 内存占用，或对比 CPU 与 `forwardtype=10`。
