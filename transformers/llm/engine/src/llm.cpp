@@ -259,6 +259,9 @@ void Llm::initRuntime() {
 
     mRuntimeManager.reset(Executor::RuntimeManager::createRuntimeManager(config));
     setRuntimeHint(mRuntimeManager);
+    if (auto executor = Express::Executor::newExecutor(mRuntimeManager)) {
+        mExecutor = std::move(executor);
+    }
 
 #if DEBUG_MODE == 1
     mRuntimeManager->setMode(MNN::Interpreter::Session_Debug);
@@ -612,9 +615,9 @@ std::vector<Express::VARP> Llm::forwardRaw(Express::VARP hiddenState, Express::V
         mContext->status = LlmStatus::INTERNAL_ERROR;
         return outputs;
     }
-    // Validate output VARP and readMap
+    // Validate output VARP without forcing device logits back to the host.
     for (auto o : outputs) {
-        if(nullptr == o || nullptr == o->readMap<float>()) {
+        if (nullptr == o || nullptr == o->getInfo()) {
             MNN_ERROR("[Error]: invalid output tensor from onForward. output_count=%zu\n", outputs.size());
             mContext->status = LlmStatus::INTERNAL_ERROR;
             return outputs;
