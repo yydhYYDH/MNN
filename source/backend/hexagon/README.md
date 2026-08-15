@@ -56,3 +56,11 @@ To run the compiled MNN with the Hexagon backend on an Android device:
 export ADSP_LIBRARY_PATH="/data/local/tmp/hexagon_libs;/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp"
 export LD_LIBRARY_PATH="/data/local/tmp/hexagon_libs:$LD_LIBRARY_PATH"
 ```
+
+### 4. Test without a Device: Offline RPC Simulator
+
+No phone required: MNN records Hexagon commands on x86 (`-DMNN_HEXAGON_OFFLINE_SIMULATOR=ON`), then replays them through the
+Qualcomm QuRT v79 simulator (`hexagon-sim`) with an HMX mock skeleton. See
+[`htp-ops-lib/tests/qurt-simulator/README.md`](htp-ops-lib/tests/qurt-simulator/README.md) for the smoke and MatMul
+graph test entry points and environment variables. Requires a Hexagon SDK; v79 only; does not model FastRPC, DMA-BUF,
+or cache-coherency overhead.
