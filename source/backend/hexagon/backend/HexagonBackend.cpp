@@ -357,7 +357,7 @@ void HexagonBackend::fp32ToFp16(const float* src, int16_t* dst, size_t size) {
             : "cc", "memory", "x10", "x11", "v0", "v30", "v31");
     }
     i += ((size - i) / 4) * 4;
-#else
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
     const float32x4_t minValue = vdupq_n_f32(-65504.0f);
     const float32x4_t maxValue = vdupq_n_f32(65504.0f);
     for (; i + 16 <= size; i += 16) {
@@ -386,6 +386,10 @@ void HexagonBackend::fp32ToFp16(const float* src, int16_t* dst, size_t size) {
         const float32x4_t v = vmaxq_f32(minValue, vminq_f32(maxValue, vld1q_f32(src + i)));
         const float16x4_t h = vcvt_f16_f32(v);
         vst1_u16(dstU16 + i, vreinterpret_u16_f16(h));
+    }
+#else
+    for (; i < size; ++i) {
+        dstU16[i] = fp32ToFp16Scalar(src[i]);
     }
 #endif
     for (; i < size; ++i) {
@@ -435,7 +439,7 @@ void HexagonBackend::fp16ToFp32(const int16_t* src, float* dst, size_t size) {
             : "cc", "memory", "v0", "v4");
     }
     i += ((size - i) / 4) * 4;
-#else
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
     for (; i + 16 <= size; i += 16) {
         const float16x4_t h0 = vreinterpret_f16_u16(vld1_u16(srcU16 + i));
         const float16x4_t h1 = vreinterpret_f16_u16(vld1_u16(srcU16 + i + 4));
@@ -455,6 +459,10 @@ void HexagonBackend::fp16ToFp32(const int16_t* src, float* dst, size_t size) {
     for (; i + 4 <= size; i += 4) {
         const float16x4_t h = vreinterpret_f16_u16(vld1_u16(srcU16 + i));
         vst1q_f32(dst + i, vcvt_f32_f16(h));
+    }
+#else
+    for (; i < size; ++i) {
+        dst[i] = fp16ToFp32Scalar(srcU16[i]);
     }
 #endif
     for (; i < size; ++i) {

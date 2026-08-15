@@ -9,6 +9,7 @@
 #include "core/OpCommonUtils.hpp"
 #include "backend/hexagon/htp-ops-lib/include/htp_command.h"
 #include <algorithm>
+#include <cmath>
 #include <string.h>
 #define HEXAGON_KV_PAGE_SIZE 256
 #define HEXAGON_ATTN_FIXED_WORKSPACE_KV 2048
@@ -326,7 +327,7 @@ ErrorCode HexagonAttention::onBuildCmd(const std::vector<Tensor *> &inputs, cons
             chunk != V->length(1)) {
             return NOT_SUPPORT;
         }
-        const float scale = (mAttnScale == 0.0f) ? (1.0f / sqrt(headDim)) : mAttnScale;
+        const float scale = (mAttnScale == 0.0f) ? (1.0f / std::sqrt(headDim)) : mAttnScale;
         FlashAttentionBlockParam params = {batch, heads, tokens, chunk, headDim, scale};
 
         std::vector<Tensor*> commandOutputs;
@@ -481,7 +482,7 @@ ErrorCode HexagonAttention::onBuildCmd(const std::vector<Tensor *> &inputs, cons
         return OUT_OF_MEMORY;
     }
 
-    float scale = (mAttnScale == 0.0f) ? (1.0f / sqrt(head_dim)) : mAttnScale;
+    float scale = (mAttnScale == 0.0f) ? (1.0f / std::sqrt(head_dim)) : mAttnScale;
 
     auto kDev = HexagonBackend::getDevicePtr(K);
     auto vDev = HexagonBackend::getDevicePtr(V);

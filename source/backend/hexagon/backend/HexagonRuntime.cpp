@@ -11,18 +11,27 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#ifdef MNN_HEXAGON_OFFLINE_RPC
+#include <atomic>
+#include <set>
+#include <stdio.h>
+#endif
 #include <MNN/MNNDefine.h>
 #include "HexagonRuntime.hpp"
 #include "HexagonBackend.hpp"
 #include "dsprpc_interface.h"
 #include "dsp_op_name.h"
+#ifdef MNN_HEXAGON_OFFLINE_RPC
+#include "offline_rpc_protocol.h"
+#endif
 #include "schema/current/Command_generated.h"
 namespace MNN {
-static const char * HTP_OPS_DL_PATH = "libMNN_htpops.so";
+static const char* HTP_OPS_DL_PATH = "libMNN_htpops.so";
 static constexpr size_t MAX_MSG_SIZE = 65536;
 static constexpr int gCommandGroupCapacity = 4096;
 static constexpr int gCommandEntrySize = 3;
 
+#ifdef MNN_HEXAGON_OFFLINE_RPC
 static std::mutex& dspMappedBuffersMutex() {
     static std::mutex mutex;
     return mutex;
@@ -61,6 +70,7 @@ static std::vector<HexagonBuffer*> snapshotDspMappedBuffers() {
     std::lock_guard<std::mutex> lock(dspMappedBuffersMutex());
     return dspMappedBuffers();
 }
+#endif
 
 static HexagonBuffer* findDspBuffer(int fd) {
     std::lock_guard<std::mutex> lock(dspMappedBuffersMutex());
@@ -87,8 +97,9 @@ public:
                 record.refCount++;
                 return true;
             }
-            MNN_ERROR("[Hexagon] fastrpc mmap conflict fd=%d old(domain=%d,ptr=%p,size=%zu) new(domain=%d,ptr=%p,size=%zu)\n",
-                      buffer->fd, record.domain, record.ptr, record.size, domain, buffer->ptr, buffer->size);
+            MNN_ERROR(
+                "[Hexagon] fastrpc mmap conflict fd=%d old(domain=%d,ptr=%p,size=%zu) new(domain=%d,ptr=%p,size=%zu)\n",
+                buffer->fd, record.domain, record.ptr, record.size, domain, buffer->ptr, buffer->size);
             return false;
         }
 
@@ -118,8 +129,10 @@ public:
         }
         auto& record = iter->second;
         if (record.domain != domain || record.ptr != buffer->ptr || record.size != buffer->size) {
-            MNN_ERROR("[Hexagon] fastrpc munmap conflict fd=%d old(domain=%d,ptr=%p,size=%zu) new(domain=%d,ptr=%p,size=%zu)\n",
-                      buffer->fd, record.domain, record.ptr, record.size, domain, buffer->ptr, buffer->size);
+            MNN_ERROR(
+                "[Hexagon] fastrpc munmap conflict fd=%d old(domain=%d,ptr=%p,size=%zu) "
+                "new(domain=%d,ptr=%p,size=%zu)\n",
+                buffer->fd, record.domain, record.ptr, record.size, domain, buffer->ptr, buffer->size);
             return;
         }
         record.refCount--;
@@ -191,9 +204,11 @@ static bool hexagonAsanCheckGuard(const HexagonBuffer* buffer, const char* tag) 
     const auto guard = static_cast<const uint8_t*>(buffer->ptr) + buffer->requestedSize;
     for (size_t i = 0; i < buffer->guardSize; ++i) {
         if (guard[i] != buffer->guardValue) {
-            MNN_ERROR("[MNN::Hexagon][ASAN] buffer guard corrupted: tag=%s fd=%d requested=%zu mapped=%zu guardOffset=%zu expected=0x%x got=0x%x\n",
-                      tag != nullptr ? tag : "", buffer->fd, buffer->requestedSize, buffer->size, i,
-                      (unsigned)buffer->guardValue, (unsigned)guard[i]);
+            MNN_ERROR(
+                "[MNN::Hexagon][ASAN] buffer guard corrupted: tag=%s fd=%d requested=%zu mapped=%zu guardOffset=%zu "
+                "expected=0x%x got=0x%x\n",
+                tag != nullptr ? tag : "", buffer->fd, buffer->requestedSize, buffer->size, i,
+                (unsigned)buffer->guardValue, (unsigned)guard[i]);
             return false;
         }
     }
@@ -216,10 +231,12 @@ static bool hexagonAsanCheckRange(const HexagonAsanRangeRecord& record, const ch
     for (size_t i = 0; i < record.guardSize; ++i) {
         if (guard[i] != gHexagonAsanGuardValue) {
             auto buffer = static_cast<HexagonBuffer*>(record.base);
-            MNN_ERROR("[MNN::Hexagon][ASAN] precise redzone corrupted: check=%s alloc=%s fd=%d offset=%zu requested=%zu guardOffset=%zu expected=0x%x got=0x%x\n",
-                      checkTag != nullptr ? checkTag : "", record.tag != nullptr ? record.tag : "",
-                      buffer != nullptr ? buffer->fd : -1, record.offset, record.requestedSize, i,
-                      (unsigned)gHexagonAsanGuardValue, (unsigned)guard[i]);
+            MNN_ERROR(
+                "[MNN::Hexagon][ASAN] precise redzone corrupted: check=%s alloc=%s fd=%d offset=%zu requested=%zu "
+                "guardOffset=%zu expected=0x%x got=0x%x\n",
+                checkTag != nullptr ? checkTag : "", record.tag != nullptr ? record.tag : "",
+                buffer != nullptr ? buffer->fd : -1, record.offset, record.requestedSize, i,
+                (unsigned)gHexagonAsanGuardValue, (unsigned)guard[i]);
             return false;
         }
     }
@@ -239,8 +256,8 @@ static bool hexagonAsanCheckRanges(const void* owner, const char* tag) {
     return valid;
 }
 
-static void hexagonAsanRegisterRange(const void* owner, const MemChunk& chunk, size_t requestedSize,
-                                     size_t guardSize, const char* tag) {
+static void hexagonAsanRegisterRange(const void* owner, const MemChunk& chunk, size_t requestedSize, size_t guardSize,
+                                     const char* tag) {
     if (chunk.first == nullptr || requestedSize == 0 || guardSize == 0) {
         return;
     }
@@ -272,9 +289,11 @@ static void hexagonAsanUnregisterRange(const void* owner, const MemChunk& chunk)
 
 static void hexagonAsanClearRanges(const void* owner) {
     auto& ranges = hexagonAsanRanges();
-    ranges.erase(std::remove_if(ranges.begin(), ranges.end(), [owner](const HexagonAsanRangeRecord& record) {
-        return owner == nullptr || record.owner == owner;
-    }), ranges.end());
+    ranges.erase(std::remove_if(ranges.begin(), ranges.end(),
+                                [owner](const HexagonAsanRangeRecord& record) {
+                                    return owner == nullptr || record.owner == owner;
+                                }),
+                 ranges.end());
 }
 
 class HexagonAsanBufferAllocator : public BufferAllocator {
@@ -292,8 +311,8 @@ public:
             return MemChunk();
         }
         if (size > static_cast<size_t>(-1) - gHexagonAsanPreciseGuardSize) {
-            MNN_ERROR("[MNN::Hexagon][ASAN] precise allocation overflow: size=%zu guard=%zu tag=%s\n",
-                      size, gHexagonAsanPreciseGuardSize, mTag != nullptr ? mTag : "");
+            MNN_ERROR("[MNN::Hexagon][ASAN] precise allocation overflow: size=%zu guard=%zu tag=%s\n", size,
+                      gHexagonAsanPreciseGuardSize, mTag != nullptr ? mTag : "");
             return MemChunk();
         }
         auto chunk = mParent->alloc(size + gHexagonAsanPreciseGuardSize, separate, align);
@@ -372,9 +391,7 @@ public:
     }
 
 private:
-    void syncTotalSize() {
-        mTotalSize = mParent != nullptr ? mParent->totalSize() : 0;
-    }
+    void syncTotalSize() { mTotalSize = mParent != nullptr ? mParent->totalSize() : 0; }
 
     std::shared_ptr<BufferAllocator> mParent;
     const char* mTag = nullptr;
@@ -388,29 +405,51 @@ public:
     virtual MemChunk onAlloc(size_t size, size_t align) override {
 #ifdef MNN_HEXAGON_ASAN
         if (size > static_cast<size_t>(-1) - gHexagonAsanGuardSize) {
-            MNN_ERROR("[MNN::Hexagon][ASAN] allocation size overflow: size=%zu guard=%zu\n", size, gHexagonAsanGuardSize);
+            MNN_ERROR("[MNN::Hexagon][ASAN] allocation size overflow: size=%zu guard=%zu\n", size,
+                      gHexagonAsanGuardSize);
             return MemChunk((void*)nullptr);
         }
         const size_t requestedSize = size;
         const size_t guardedSize = size + gHexagonAsanGuardSize;
         if (guardedSize > static_cast<size_t>(-1) - (gHexagonAsanPageSize - 1)) {
-            MNN_ERROR("[MNN::Hexagon][ASAN] mapped size overflow: size=%zu guard=%zu page=%zu\n",
-                      size, gHexagonAsanGuardSize, gHexagonAsanPageSize);
+            MNN_ERROR("[MNN::Hexagon][ASAN] mapped size overflow: size=%zu guard=%zu page=%zu\n", size,
+                      gHexagonAsanGuardSize, gHexagonAsanPageSize);
             return MemChunk((void*)nullptr);
         }
-        const size_t mappedSize = ((guardedSize + gHexagonAsanPageSize - 1) / gHexagonAsanPageSize) * gHexagonAsanPageSize;
+        const size_t mappedSize =
+            ((guardedSize + gHexagonAsanPageSize - 1) / gHexagonAsanPageSize) * gHexagonAsanPageSize;
 #else
         const size_t mappedSize = size;
 #endif
-        void * data = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_FLAG_UNCACHED, mappedSize);
+        void* data = nullptr;
+#ifdef MNN_HEXAGON_OFFLINE_RPC
+        const size_t hostAlignment = 2048;
+        if (posix_memalign(&data, hostAlignment, mappedSize) != 0) {
+            data = nullptr;
+        } else {
+            ::memset(data, 0, mappedSize);
+        }
+#else
+        data = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_FLAG_UNCACHED, mappedSize);
+#endif
         if (nullptr == data) {
             FUNC_PRINT(1);
             return MemChunk((void*)nullptr);
         }
-        auto fd = rpcmem_to_fd(data);
+        int fd = -1;
+#ifdef MNN_HEXAGON_OFFLINE_RPC
+        static std::atomic<int> nextSyntheticFd(100);
+        fd = nextSyntheticFd.fetch_add(1);
+#else
+        fd = rpcmem_to_fd(data);
+#endif
         if (fd == -1) {
             FUNC_PRINT(1);
+#ifdef MNN_HEXAGON_OFFLINE_RPC
+            free(data);
+#else
             rpcmem_free(data);
+#endif
             return MemChunk((void*)nullptr);
         }
         auto buf = new HexagonBuffer;
@@ -424,14 +463,18 @@ public:
         buf->guardValue = gHexagonAsanGuardValue;
         hexagonAsanInitGuard(buf);
 #endif
+#ifndef MNN_HEXAGON_OFFLINE_RPC
         if (!buf->lazyMap && !gMmapManager().map(CDSP_DOMAIN_ID, buf)) {
             rpcmem_free(data);
             delete buf;
             return MemChunk((void*)nullptr);
         }
         buf->mapped = !buf->lazyMap;
+#endif
+#ifdef MNN_HEXAGON_OFFLINE_RPC
         registerDspMappedBuffer(buf);
-//        MNN_PRINT("[Hexagon] Alloc %d, size=%d\n", buf->fd, buf->size);
+#endif
+        //        MNN_PRINT("[Hexagon] Alloc %d, size=%d\n", buf->fd, buf->size);
         return buf;
     }
     virtual void onRelease(MemChunk ptr) override {
@@ -439,8 +482,11 @@ public:
         if (buf == nullptr) {
             return;
         }
-//        MNN_PRINT("[Hexagon] Free %d, size=%d\n", buf->fd, buf->size);
+        //        MNN_PRINT("[Hexagon] Free %d, size=%d\n", buf->fd, buf->size);
+#ifdef MNN_HEXAGON_OFFLINE_RPC
         unregisterDspMappedBuffer(buf);
+#endif
+#ifndef MNN_HEXAGON_OFFLINE_RPC
 #ifdef MNN_HEXAGON_ASAN
         hexagonAsanCheckGuard(buf, "release");
 #endif
@@ -449,8 +495,12 @@ public:
             buf->mapped = false;
         }
         rpcmem_free(buf->ptr);
+#else
+        free(buf->ptr);
+#endif
         delete buf;
     }
+
 private:
     bool mLazyMap = false;
 };
@@ -460,12 +510,12 @@ private:
 struct HexagonContext {
     std::shared_ptr<DspRpcInterface> rpc;
     // HTP ops backend library
-    void * ops_dl_handle = nullptr;
+    void* ops_dl_handle = nullptr;
     bool init = false;
-    int(*getHtpInfo)(int fd, int offset) = nullptr;
-    int(*getHtpInfoProfile)(int fd, int offset) = nullptr;
-    int(*powerAcquire)() = nullptr;
-    int(*powerRelease)() = nullptr;
+    int (*getHtpInfo)(int fd, int offset) = nullptr;
+    int (*getHtpInfoProfile)(int fd, int offset) = nullptr;
+    int (*powerAcquire)() = nullptr;
+    int (*powerRelease)() = nullptr;
     HexagonFunctions functions{};
     ~HexagonContext();
 };
@@ -494,6 +544,12 @@ static std::shared_ptr<HexagonContext> getOrCreateHexagonLib() {
         return lib;
     }
     lib = std::make_shared<HexagonContext>();
+#ifdef MNN_HEXAGON_OFFLINE_RPC
+    lib->init = true;
+    gWeakHexagonLib = lib;
+    gActiveHexagonContext = lib.get();
+    return lib;
+#else
     lib->rpc = std::make_shared<DspRpcInterface>();
     if (!lib->rpc->valid()) {
         MNN_ERROR("[MNN::Hexagon] Open libcdsprpc.so failed\n");
@@ -509,19 +565,23 @@ static std::shared_ptr<HexagonContext> getOrCreateHexagonLib() {
     lib->getHtpInfoProfile = (decltype(lib->getHtpInfoProfile))dlsym(lib->ops_dl_handle, "htp_ops_rpc_getInfoProfile");
     lib->powerAcquire = (decltype(lib->powerAcquire))dlsym(lib->ops_dl_handle, "htp_ops_rpc_power_acquire");
     lib->powerRelease = (decltype(lib->powerRelease))dlsym(lib->ops_dl_handle, "htp_ops_rpc_power_release");
-    lib->functions.execute_command_group = (decltype(lib->functions.execute_command_group))dlsym(lib->ops_dl_handle, "htp_rpc_execute_command_group");
-    lib->functions.execute_command_group_profile = (decltype(lib->functions.execute_command_group_profile))dlsym(lib->ops_dl_handle, "htp_rpc_execute_command_group_profile");
+    lib->functions.execute_command_group =
+        (decltype(lib->functions.execute_command_group))dlsym(lib->ops_dl_handle, "htp_rpc_execute_command_group");
+    lib->functions.execute_command_group_profile = (decltype(lib->functions.execute_command_group_profile))dlsym(
+        lib->ops_dl_handle, "htp_rpc_execute_command_group_profile");
     lib->functions.power_acquire = lib->powerAcquire;
     lib->functions.power_release = lib->powerRelease;
     if (lib->functions.execute_command_group == nullptr) {
         MNN_ERROR("[MNN::Hexagon] Failed to dlsym htp_rpc_execute_command_group, error=%s\n", dlerror());
     } else {
-        MNN_PRINT("[MNN::Hexagon] Successfully loaded htp_rpc_execute_command_group at %p\n", lib->functions.execute_command_group);
+        MNN_PRINT("[MNN::Hexagon] Successfully loaded htp_rpc_execute_command_group at %p\n",
+                  lib->functions.execute_command_group);
     }
     lib->init = true;
     gWeakHexagonLib = lib;
     gActiveHexagonContext = lib.get();
     return lib;
+#endif
 }
 
 HexagonContext::~HexagonContext() {
@@ -557,6 +617,9 @@ static std::mutex& dspSessionMutex() {
 static void closeDspSessionLocked(HexagonContext* context);
 
 static bool openDspSessionLocked(HexagonContext* context) {
+#ifdef MNN_HEXAGON_OFFLINE_RPC
+    return context != nullptr;
+#else
     if (context == nullptr || context->ops_dl_handle == nullptr) {
         return false;
     }
@@ -580,9 +643,13 @@ static bool openDspSessionLocked(HexagonContext* context) {
         return false;
     }
     return true;
+#endif
 }
 
 static void closeDspSessionLocked(HexagonContext* context) {
+#ifdef MNN_HEXAGON_OFFLINE_RPC
+    (void)context;
+#else
     gMmapManager().unmapAll();
     if (context != nullptr && context->ops_dl_handle != nullptr) {
         using close_session_fn = void();
@@ -591,10 +658,15 @@ static void closeDspSessionLocked(HexagonContext* context) {
             close_session();
         }
     }
+#endif
 }
 
 static bool ensureDspSessionOnCurrentThreadLocked(HexagonContext* context) {
+#ifdef MNN_HEXAGON_OFFLINE_RPC
+    return context != nullptr && gDspSessionRefCount > 0;
+#else
     return context != nullptr && context->ops_dl_handle != nullptr && gDspSessionRefCount > 0;
+#endif
 }
 
 static bool acquireDspPowerLocked(HexagonContext* context) {
@@ -642,7 +714,11 @@ static void releaseDspPower(HexagonContext* context) {
 
 static bool acquireDspSession(HexagonContext* context) {
     std::lock_guard<std::mutex> lock(dspSessionMutex());
-    if (context == nullptr || context->ops_dl_handle == nullptr) {
+    if (context == nullptr
+#ifndef MNN_HEXAGON_OFFLINE_RPC
+        || context->ops_dl_handle == nullptr
+#endif
+    ) {
         return false;
     }
     if (gDspSessionRefCount > 0) {
@@ -650,9 +726,13 @@ static bool acquireDspSession(HexagonContext* context) {
         return true;
     }
 
+#ifndef MNN_HEXAGON_OFFLINE_RPC
     rpcmem_init();
+#endif
     if (!openDspSessionLocked(context)) {
+#ifndef MNN_HEXAGON_OFFLINE_RPC
         rpcmem_deinit();
+#endif
         return false;
     }
     gDspSessionRefCount = 1;
@@ -670,7 +750,9 @@ static void releaseDspSession(HexagonContext* context) {
     }
     gDspPowerRefCount = 0;
     closeDspSessionLocked(context);
+#ifndef MNN_HEXAGON_OFFLINE_RPC
     rpcmem_deinit();
+#endif
 }
 
 const HexagonFunctions* HexagonRuntime::getDstFunctions() {
@@ -766,7 +848,8 @@ bool HexagonRuntime::asanCheckAllBuffers(const char* tag) const {
     return valid;
 }
 
-std::shared_ptr<BufferAllocator> HexagonRuntime::asanWrapAllocator(std::shared_ptr<BufferAllocator> allocator, const char* tag) {
+std::shared_ptr<BufferAllocator> HexagonRuntime::asanWrapAllocator(std::shared_ptr<BufferAllocator> allocator,
+                                                                   const char* tag) {
     if (allocator == nullptr) {
         return allocator;
     }
@@ -777,7 +860,8 @@ size_t HexagonRuntime::asanPreciseGuardSize() {
     return gHexagonAsanPreciseGuardSize;
 }
 
-void HexagonRuntime::asanRegisterRange(const void* owner, const MemChunk& chunk, size_t requestedSize, size_t guardSize, const char* tag) {
+void HexagonRuntime::asanRegisterRange(const void* owner, const MemChunk& chunk, size_t requestedSize, size_t guardSize,
+                                       const char* tag) {
     hexagonAsanRegisterRange(owner, chunk, requestedSize, guardSize, tag);
 }
 
@@ -889,6 +973,173 @@ bool HexagonRuntime::pushCommand(const MemChunk& cmdChunk, int cmdSize, bool nee
     return true;
 }
 
+void HexagonRuntime::recordOfflineCommandGroup() const {
+    std::set<int> tensorFds;
+    for (int i = 0; i < mCommandGroupCount; ++i) {
+        int fd = mCommandGroup->commands[i * gCommandEntrySize];
+        int offset = mCommandGroup->commands[i * gCommandEntrySize + 1];
+        int size = mCommandGroup->commands[i * gCommandEntrySize + 2];
+        if (size < 0)
+            size = -size;
+        HexagonBuffer* commandBuffer = nullptr;
+        for (auto* buffer : snapshotDspMappedBuffers()) {
+            if (buffer != nullptr && buffer->fd == fd) {
+                commandBuffer = buffer;
+                break;
+            }
+        }
+        if (commandBuffer == nullptr || offset < 0 || static_cast<size_t>(offset + size) > commandBuffer->size) {
+            continue;
+        }
+        const uint8_t* data = static_cast<const uint8_t*>(commandBuffer->ptr) + offset;
+        auto command = flatbuffers::GetRoot<DSPCOMMAND::Command>(data);
+        if (command->inputs() != nullptr) {
+            for (auto tensor : *command->inputs()) {
+                if (tensor->fd() >= 0)
+                    tensorFds.insert(tensor->fd());
+            }
+        }
+        if (command->outputs() != nullptr) {
+            for (auto tensor : *command->outputs()) {
+                if (tensor->fd() >= 0)
+                    tensorFds.insert(tensor->fd());
+            }
+        }
+        mOfflineRecordedCommands.emplace_back(data, data + size);
+    }
+
+    const auto allBuffers = snapshotDspMappedBuffers();
+    for (int fd : tensorFds) {
+        for (auto* buffer : allBuffers) {
+            if (buffer == nullptr || buffer->fd != fd)
+                continue;
+            uint32_t flags = 0;
+            for (const auto& output : mPendingHexagonOutputs) {
+                if (output.fd == fd)
+                    flags |= kOfflineRpcBufferOutput;
+            }
+            for (const auto& output : mPendingHostOutputs) {
+                if (output.fd == fd)
+                    flags |= kOfflineRpcBufferOutput;
+            }
+            auto recorded = std::find_if(mOfflineRecordedBuffers.begin(), mOfflineRecordedBuffers.end(),
+                                         [fd](const OfflineRecordedBuffer& item) { return item.fd == fd; });
+            if (recorded == mOfflineRecordedBuffers.end()) {
+                OfflineRecordedBuffer item;
+                item.fd = fd;
+                item.flags = flags;
+                const auto* begin = static_cast<const uint8_t*>(buffer->ptr);
+                item.data.assign(begin, begin + buffer->size);
+                mOfflineRecordedBuffers.emplace_back(std::move(item));
+            } else {
+                recorded->flags |= flags;
+            }
+            break;
+        }
+    }
+
+    if (!mPendingHexagonOutputs.empty()) {
+        const auto& output = mPendingHexagonOutputs.back();
+        mOfflineOutputFd = static_cast<uint32_t>(output.fd);
+        mOfflineOutputOffset = static_cast<uint32_t>(output.offset);
+        mOfflineOutputSize = static_cast<uint32_t>(output.size);
+    } else if (!mPendingHostOutputs.empty()) {
+        const auto& output = mPendingHostOutputs.back();
+        mOfflineOutputFd = static_cast<uint32_t>(output.fd);
+        mOfflineOutputOffset = static_cast<uint32_t>(output.offset);
+        mOfflineOutputSize = static_cast<uint32_t>(output.size);
+    }
+    if (!mOfflineRecordedCommands.empty()) {
+        const auto& lastCommandData = mOfflineRecordedCommands.back();
+        const auto* lastCommand = flatbuffers::GetRoot<DSPCOMMAND::Command>(lastCommandData.data());
+        if (lastCommand->outputs() != nullptr && lastCommand->outputs()->size() > 0) {
+            const auto* output = lastCommand->outputs()->Get(0);
+            mOfflineOutputFd = static_cast<uint32_t>(output->fd());
+            mOfflineOutputOffset = static_cast<uint32_t>(output->offset());
+            for (const auto& record : mPendingHexagonOutputs) {
+                if (record.fd == output->fd() && record.offset == output->offset()) {
+                    mOfflineOutputSize = static_cast<uint32_t>(record.size);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+void HexagonRuntime::writeOfflineRequest() const {
+    const char* recordPath = mOfflineRecordPath.c_str();
+    const std::string temporaryPath = mOfflineRecordPath + ".tmp";
+    FILE* file = fopen(temporaryPath.c_str(), "wb");
+    if (file == nullptr) {
+        return;
+    }
+    std::vector<OfflineRpcBufferDesc> bufferDescs;
+    std::vector<std::vector<OfflineRpcChunkDesc>> bufferChunks;
+    bufferDescs.reserve(mOfflineRecordedBuffers.size());
+    bufferChunks.reserve(mOfflineRecordedBuffers.size());
+    size_t storedBytes = 0;
+    for (const auto& buffer : mOfflineRecordedBuffers) {
+        std::vector<OfflineRpcChunkDesc> chunks;
+        size_t pageOffset = 0;
+        while (pageOffset < buffer.data.size()) {
+            const size_t pageSize = std::min<size_t>(kOfflineRpcPageBytes, buffer.data.size() - pageOffset);
+            bool nonZero = false;
+            for (size_t byte = 0; byte < pageSize; ++byte) {
+                if (buffer.data[pageOffset + byte] != 0) {
+                    nonZero = true;
+                    break;
+                }
+            }
+            if (nonZero) {
+                if (!chunks.empty() && chunks.back().offset + chunks.back().size == pageOffset) {
+                    chunks.back().size += static_cast<uint32_t>(pageSize);
+                } else {
+                    chunks.push_back({static_cast<uint32_t>(pageOffset), static_cast<uint32_t>(pageSize)});
+                }
+                storedBytes += pageSize;
+            }
+            pageOffset += pageSize;
+        }
+        bufferDescs.push_back({buffer.fd, static_cast<uint32_t>(buffer.data.size()), buffer.alignment, buffer.flags,
+                               static_cast<uint32_t>(chunks.size())});
+        bufferChunks.emplace_back(std::move(chunks));
+    }
+    std::vector<OfflineRpcCommandDesc> commandDescs(mOfflineRecordedCommands.size());
+    for (size_t i = 0; i < mOfflineRecordedCommands.size(); ++i) {
+        commandDescs[i] = {static_cast<uint32_t>(mOfflineRecordedCommands[i].size()), 0};
+    }
+    OfflineRpcRequestHeader header = {kOfflineRpcRequestMagic,
+                                      kOfflineRpcVersion,
+                                      static_cast<uint32_t>(mOfflineRecordedBuffers.size()),
+                                      static_cast<uint32_t>(mOfflineRecordedCommands.size()),
+                                      {0, mOfflineOutputFd, mOfflineOutputOffset, mOfflineOutputSize, 0, 0}};
+    bool ok = fwrite(&header, 1, sizeof(header), file) == sizeof(header);
+    ok = ok && fwrite(bufferDescs.data(), sizeof(OfflineRpcBufferDesc), bufferDescs.size(), file) == bufferDescs.size();
+    ok = ok && fwrite(commandDescs.data(), sizeof(OfflineRpcCommandDesc), commandDescs.size(), file) == commandDescs.size();
+    for (size_t i = 0; ok && i < mOfflineRecordedCommands.size(); ++i) {
+        ok = fwrite(mOfflineRecordedCommands[i].data(), 1, commandDescs[i].size, file) == commandDescs[i].size;
+    }
+    for (size_t bufferIndex = 0; ok && bufferIndex < mOfflineRecordedBuffers.size(); ++bufferIndex) {
+        const auto& buffer = mOfflineRecordedBuffers[bufferIndex];
+        const auto& chunks = bufferChunks[bufferIndex];
+        for (const auto& chunk : chunks) {
+            ok = fwrite(&chunk, sizeof(OfflineRpcChunkDesc), 1, file) == 1;
+            if (!ok)
+                break;
+            ok = fwrite(buffer.data.data() + chunk.offset, 1, chunk.size, file) == chunk.size;
+        }
+    }
+    ok = fclose(file) == 0 && ok;
+    if (ok) {
+        ok = rename(temporaryPath.c_str(), recordPath) == 0;
+    }
+    if (!ok) {
+        remove(temporaryPath.c_str());
+    }
+    MNN_PRINT("[Hexagon][OfflineRPC] recorded %zu commands, %zu buffers, %zu stored bytes to %s, ok=%d\n",
+              mOfflineRecordedCommands.size(), mOfflineRecordedBuffers.size(), storedBytes, recordPath, ok ? 1 : 0);
+}
+
 void HexagonRuntime::flushCommand() const {
     if (mCommandGroupCount == 0 && mPendingHostOutputs.empty() && mPendingHostInputs.empty() &&
         mPendingHexagonOutputs.empty()) {
@@ -898,6 +1149,33 @@ void HexagonRuntime::flushCommand() const {
         MNN_ERROR("[Hexagon] flushCommand: command group buffer is not allocated\n");
         return;
     }
+#ifdef MNN_HEXAGON_OFFLINE_RPC
+    const char* recordPath = getenv("MNN_HEXAGON_OFFLINE_RPC_PATH");
+    if (recordPath != nullptr && recordPath[0] != '\0') {
+        if (mOfflineRecordPath != recordPath) {
+            mOfflineRecordPath = recordPath;
+            mOfflineOutputFd = 0;
+            mOfflineOutputOffset = 0;
+            mOfflineOutputSize = 0;
+            mOfflineRecordedCommands.clear();
+            mOfflineRecordedBuffers.clear();
+        }
+        if (mCommandGroupCount > 0) {
+            recordOfflineCommandGroup();
+            writeOfflineRequest();
+        }
+        for (const auto& chunk : mQueuedCommandChunks)
+            mCommandAlloc->free(chunk);
+        mQueuedCommandChunks.clear();
+        mPendingHostInputs.clear();
+        mPendingHostOutputs.clear();
+        mPendingHexagonOutputs.clear();
+        mCommandGroupCount = 0;
+        if (++mCommandSerial == 0)
+            mCommandSerial = 1;
+        return;
+    }
+#endif
     auto context = getContext();
     auto functions = context != nullptr ? &context->functions : nullptr;
     MemChunk syncGroupChunk;
@@ -919,7 +1197,8 @@ void HexagonRuntime::flushCommand() const {
         for (const auto& record : mPendingHexagonOutputs) {
             outputTensors.emplace_back(DSPCOMMAND::CreateTensor(builder, record.fd, record.offset, record.size));
         }
-        auto syncGroup = DSPCOMMAND::CreateSyncGroup(builder, builder.CreateVector(inputTensors), builder.CreateVector(outputTensors));
+        auto syncGroup = DSPCOMMAND::CreateSyncGroup(builder, builder.CreateVector(inputTensors),
+                                                     builder.CreateVector(outputTensors));
         builder.Finish(syncGroup);
         syncGroupSize = (int)builder.GetSize();
         syncGroupChunk = mCommandAlloc->alloc(syncGroupSize);
@@ -960,9 +1239,7 @@ void HexagonRuntime::flushCommand() const {
             std::lock_guard<std::mutex> lock(dspSessionMutex());
             if (ensureDspSessionOnCurrentThreadLocked(context)) {
                 ret = functions->execute_command_group_profile(groupDev.first, groupDev.second, commandCount,
-                                                               syncGroupFd,
-                                                               syncGroupOffset,
-                                                               syncGroupSize,
+                                                               syncGroupFd, syncGroupOffset, syncGroupSize,
                                                                profileDev.first, profileDev.second, 256 * sizeof(int));
             } else {
                 ret = -1;
@@ -981,10 +1258,8 @@ void HexagonRuntime::flushCommand() const {
         {
             std::lock_guard<std::mutex> lock(dspSessionMutex());
             if (ensureDspSessionOnCurrentThreadLocked(context)) {
-                ret = functions->execute_command_group(groupDev.first, groupDev.second, commandCount,
-                                                       syncGroupFd,
-                                                       syncGroupOffset,
-                                                       syncGroupSize);
+                ret = functions->execute_command_group(groupDev.first, groupDev.second, commandCount, syncGroupFd,
+                                                       syncGroupOffset, syncGroupSize);
             } else {
                 ret = -1;
             }
@@ -1010,10 +1285,8 @@ void HexagonRuntime::flushCommand() const {
         {
             std::lock_guard<std::mutex> lock(dspSessionMutex());
             if (ensureDspSessionOnCurrentThreadLocked(context)) {
-                ret = functions->execute_command_group(groupDev.first, groupDev.second, commandCount,
-                                                       syncGroupFd,
-                                                       syncGroupOffset,
-                                                       syncGroupSize);
+                ret = functions->execute_command_group(groupDev.first, groupDev.second, commandCount, syncGroupFd,
+                                                       syncGroupOffset, syncGroupSize);
             } else {
                 ret = -1;
             }
@@ -1063,12 +1336,12 @@ void HexagonRuntime::flushCommand() const {
 float HexagonRuntime::onGetMemoryInMB() {
     auto staticMemoryInMB = mStaticAlloc->totalSize() / 1024.0f / 1024.0f;
     auto commandMemoryInMB = mCommandAlloc->totalSize() / 1024.0f / 1024.0f;
-    auto weightInMB = mWeightAlloc->totalSize()  / 1024.0f / 1024.0f;
+    auto weightInMB = mWeightAlloc->totalSize() / 1024.0f / 1024.0f;
     auto lazyWeightInMB = mLazyWeightAlloc->totalSize() / 1024.0f / 1024.0f;
     float dynamicMemoryInMB = 0.0f;
-//    for (auto& buf : mDynamic) {
-//        dynamicMemoryInMB += buf.currentSize / 1024.0f / 1024.0f;
-//    }
+    //    for (auto& buf : mDynamic) {
+    //        dynamicMemoryInMB += buf.currentSize / 1024.0f / 1024.0f;
+    //    }
     return staticMemoryInMB + dynamicMemoryInMB + commandMemoryInMB + weightInMB + lazyWeightInMB;
 }
 
@@ -1111,6 +1384,15 @@ HexagonRuntime::HexagonRuntime(const Backend::Info& info) {
         ::memset(HexagonBackend::getPtr(mProfileChunk), 0, 256 * sizeof(int));
     }
 #endif
+#ifdef MNN_HEXAGON_OFFLINE_RPC
+    mInfo.vectorSize = 64;
+    mInfo.EP = 32;
+    mInfo.LP = 32;
+    mInfo.HP = 32;
+    mInfo.vtcmSize = 8 * 1024 * 1024;
+    mInfo.maxThreads = 4;
+    mInfo.hvxArch = 0x79;
+#else
     {
         const bool powerAcquired = acquireDspPower(context);
         auto infoMem = mStaticAlloc->alloc(256);
@@ -1119,29 +1401,30 @@ HexagonRuntime::HexagonRuntime(const Backend::Info& info) {
             MNN_ERROR("[Hexagon] failed to allocate HTP info buffer\n");
         } else {
 #ifdef MNN_GPU_TIME_PROFILE
-        int err = 0;
-        {
-            std::lock_guard<std::mutex> lock(dspSessionMutex());
-            if (!ensureDspSessionOnCurrentThreadLocked(context)) {
-                err = -1;
-            } else if (context != nullptr && context->getHtpInfoProfile != nullptr) {
-                err = context->getHtpInfoProfile(buf->fd, infoMem.second);
-            } else if (context != nullptr && context->getHtpInfo != nullptr) {
-                err = context->getHtpInfo(buf->fd, infoMem.second);
-            } else {
-                err = -1;
+            int err = 0;
+            {
+                std::lock_guard<std::mutex> lock(dspSessionMutex());
+                if (!ensureDspSessionOnCurrentThreadLocked(context)) {
+                    err = -1;
+                } else if (context != nullptr && context->getHtpInfoProfile != nullptr) {
+                    err = context->getHtpInfoProfile(buf->fd, infoMem.second);
+                } else if (context != nullptr && context->getHtpInfo != nullptr) {
+                    err = context->getHtpInfo(buf->fd, infoMem.second);
+                } else {
+                    err = -1;
+                }
             }
-        }
 #else
-        int err = 0;
-        {
-            std::lock_guard<std::mutex> lock(dspSessionMutex());
-            if (ensureDspSessionOnCurrentThreadLocked(context) && context != nullptr && context->getHtpInfo != nullptr) {
-                err = context->getHtpInfo(buf->fd, infoMem.second);
-            } else {
-                err = -1;
+            int err = 0;
+            {
+                std::lock_guard<std::mutex> lock(dspSessionMutex());
+                if (ensureDspSessionOnCurrentThreadLocked(context) && context != nullptr &&
+                    context->getHtpInfo != nullptr) {
+                    err = context->getHtpInfo(buf->fd, infoMem.second);
+                } else {
+                    err = -1;
+                }
             }
-        }
 #endif
             if (0 != err) {
                 FUNC_PRINT(err);
@@ -1155,6 +1438,7 @@ HexagonRuntime::HexagonRuntime(const Backend::Info& info) {
             releaseDspPower(context);
         }
     }
+#endif
     std::shared_ptr<BufferAllocator> weightAlloc(new EagerBufferAllocator(allocator, 128, weightMinAllocSize));
 #ifdef MNN_HEXAGON_ASAN
     weightAlloc = asanWrapAllocator(weightAlloc, "weight");
@@ -1171,43 +1455,43 @@ HexagonRuntime::HexagonRuntime(const Backend::Info& info) {
         mInfo.maxThreads = 1;
     }
 #ifdef MNN_GPU_TIME_PROFILE
-    for (int i=0; i<6; ++i) {
+    for (int i = 0; i < 6; ++i) {
         FUNC_PRINT_ALL(mInfo.flops[i], f);
     }
 #endif
-    MNN_PRINT("[MNN::Hexagon] vectorSize=%d, vtcmSize=%d, maxThreads=%d, hvxArch=%d\n",
-              mInfo.vectorSize, mInfo.vtcmSize, mInfo.maxThreads, mInfo.hvxArch);
+    MNN_PRINT("[MNN::Hexagon] vectorSize=%d, vtcmSize=%d, maxThreads=%d, hvxArch=%d\n", mInfo.vectorSize,
+              mInfo.vtcmSize, mInfo.maxThreads, mInfo.hvxArch);
 
     if (false) {
         int err = 0;
         auto aMem = mStaticAlloc->alloc(mInfo.EP * mInfo.LP * sizeof(float));
         auto APtr = (int16_t*)((uint8_t*)((HexagonBuffer*)aMem.first)->ptr + aMem.second);
-        for (int i=0; i<mInfo.EP; ++i) {
-            for (int j=0; j<mInfo.LP; ++j) {
+        for (int i = 0; i < mInfo.EP; ++i) {
+            for (int j = 0; j < mInfo.LP; ++j) {
                 APtr[mInfo.LP * i + j] = (i * mInfo.LP + j) / 10.0f;
             }
         }
         auto bMem = mStaticAlloc->alloc(mInfo.HP * mInfo.LP * sizeof(int16_t));
         auto BPtr = (int16_t*)((uint8_t*)((HexagonBuffer*)bMem.first)->ptr + bMem.second);
-        for (int i=0; i<mInfo.HP; ++i) {
-            for (int j=0; j<mInfo.LP; ++j) {
+        for (int i = 0; i < mInfo.HP; ++i) {
+            for (int j = 0; j < mInfo.LP; ++j) {
                 BPtr[mInfo.LP * i + j] = (rand() % 100) / 100.0f;
 
-//                if (i ==j) {
-//                    BPtr[mInfo.LP * i + j] = 1.0f;
-//                } else {
-//                    BPtr[mInfo.LP * i + j] = 0.0f;
-//                }
+                //                if (i ==j) {
+                //                    BPtr[mInfo.LP * i + j] = 1.0f;
+                //                } else {
+                //                    BPtr[mInfo.LP * i + j] = 0.0f;
+                //                }
             }
         }
         std::vector<float> CTarget(mInfo.EP * mInfo.HP);
-        for (int i=0; i<mInfo.HP; ++i) {
-            for (int j=0; j<mInfo.EP; ++j) {
+        for (int i = 0; i < mInfo.HP; ++i) {
+            for (int j = 0; j < mInfo.EP; ++j) {
                 float summer = 0.0f;
-                for (int k=0; k<mInfo.LP; ++k) {
-                    summer += APtr[k+j*mInfo.LP] * BPtr[i+k*mInfo.LP];
+                for (int k = 0; k < mInfo.LP; ++k) {
+                    summer += APtr[k + j * mInfo.LP] * BPtr[i + k * mInfo.LP];
                 }
-                CTarget[j*mInfo.HP+i] = summer;
+                CTarget[j * mInfo.HP + i] = summer;
             }
         }
 
@@ -1218,11 +1502,10 @@ HexagonRuntime::HexagonRuntime(const Backend::Info& info) {
             FUNC_PRINT(err);
         }
         auto res = (int16_t*)((uint8_t*)buf->ptr + testMem.second);
-        for (int i=0; i<mInfo.HP; ++i) {
+        for (int i = 0; i < mInfo.HP; ++i) {
             std::ostringstream os;
-            for (int j=0; j<mInfo.EP; ++j)
-            {
-                os << (float)res[j*mInfo.HP+i] << " : " << CTarget[j*mInfo.HP+i] << ", ";
+            for (int j = 0; j < mInfo.EP; ++j) {
+                os << (float)res[j * mInfo.HP + i] << " : " << CTarget[j * mInfo.HP + i] << ", ";
             }
             MNN_PRINT("%s\n", os.str().c_str());
         }
@@ -1240,10 +1523,8 @@ HexagonRuntime::~HexagonRuntime() {
         MNN_PRINT("Hexagon DSP Profile:\n");
         MNN_PRINT("Command groups: %d, commands: %d, sync-only groups: %d, max commands/group: %d\n",
                   mProfileFlushCount, mProfileCommandCount, mProfileSyncOnlyFlushCount, mProfileMaxCommandsPerFlush);
-        MNN_PRINT("Command dirty: %d, clean-skip: %d, copied: %d\n",
-                  mProfileDirtyCommandCount,
-                  mProfileCommandCount - mProfileDirtyCommandCount,
-                  mProfileCopiedCommandCount);
+        MNN_PRINT("Command dirty: %d, clean-skip: %d, copied: %d\n", mProfileDirtyCommandCount,
+                  mProfileCommandCount - mProfileDirtyCommandCount, mProfileCopiedCommandCount);
         for (int i = 0; i < 256; i++) {
             if (profile_data[i] > 0) {
                 MNN_PRINT("DSPOpType %s (%d): %f ms\n", getDSPOpName(i), i, profile_data[i] / 1000.0f);
@@ -1260,15 +1541,13 @@ HexagonRuntime::~HexagonRuntime() {
         }
         if (totalCopyCalls > 0) {
             MNN_PRINT("Hexagon onCopyBuffer Profile:\n");
-            MNN_PRINT("onCopyBuffer total: calls=%d, time=%f ms, flush=%f ms, host=%f ms\n",
-                      totalCopyCalls, totalCopyUs / 1000.0f, totalCopyFlushUs / 1000.0f,
-                      (totalCopyUs - totalCopyFlushUs) / 1000.0f);
+            MNN_PRINT("onCopyBuffer total: calls=%d, time=%f ms, flush=%f ms, host=%f ms\n", totalCopyCalls,
+                      totalCopyUs / 1000.0f, totalCopyFlushUs / 1000.0f, (totalCopyUs - totalCopyFlushUs) / 1000.0f);
             for (int i = 0; i < 4; ++i) {
                 if (mProfileCopyCalls[i] > 0) {
                     MNN_PRINT("onCopyBuffer %s: calls=%d, bytes=%llu, time=%f ms, flush=%f ms, host=%f ms\n",
-                              copyNames[i], mProfileCopyCalls[i],
-                              (unsigned long long)mProfileCopyBytes[i], mProfileCopyUs[i] / 1000.0f,
-                              mProfileCopyFlushUs[i] / 1000.0f,
+                              copyNames[i], mProfileCopyCalls[i], (unsigned long long)mProfileCopyBytes[i],
+                              mProfileCopyUs[i] / 1000.0f, mProfileCopyFlushUs[i] / 1000.0f,
                               (mProfileCopyUs[i] - mProfileCopyFlushUs[i]) / 1000.0f);
                 }
             }
@@ -1334,7 +1613,8 @@ void HexagonRuntime::onGabageCollect(int level) {
 }
 
 bool HexagonRuntime::onCheckInfo(Backend::Info& info) const {
-    if (info.type != MNN_FORWARD_HEXAGON) return false;
+    if (info.type != MNN_FORWARD_HEXAGON)
+        return false;
     info.numThread = 1; // 强制单线程
     return true;
 }
@@ -1350,7 +1630,8 @@ Runtime* HexagonRuntimeCreator::onCreate(const Backend::Info& info) const {
 }
 
 bool HexagonRuntimeCreator::onValid(Backend::Info& info) const {
-    if (info.type != MNN_FORWARD_HEXAGON) return false;
+    if (info.type != MNN_FORWARD_HEXAGON)
+        return false;
     info.mode = Backend::Info::DIRECT;
     return true;
 }

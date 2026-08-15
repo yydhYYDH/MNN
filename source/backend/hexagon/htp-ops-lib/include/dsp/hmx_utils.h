@@ -101,23 +101,42 @@ static HMX_INLINE_ALWAYS void hmx_consume_accumulator_fp16(__fp16 *out) {
   Q6_cvt_hf_acc_R(2);
   __builtin_HEXAGON_M8_mxmem(out, 0);
 #else
-  for (int r = 0; r < HMX_FP16_TILE_N_ROWS; r++) {
-    for (int c = 0; c < HMX_FP16_TILE_N_COLS; c++) {
-      float sum = 0.0f;
-      for (size_t t = 0; t < g_mock_tile_count; t++) {
-        for (int k = 0; k < HMX_FP16_TILE_N_COLS; k++) {
-          int a_idx = (r / 2) * 64 + k * 2 + (r % 2);
-          int w_idx = (k / 2) * 64 + c * 2 + (k % 2);
-          float a = (float)g_mock_row_tiles[t][a_idx];
-          float w = (float)g_mock_col_tiles[t][w_idx];
-          sum += a * w;
+  HVX_Vector scale = Q6_Vh_vsplat_R(0x3c00);
+  HVX_Vector bias  = Q6_V_vzero();
+  if (g_mock_scales != NULL) {
+    HVX_Vector scale_bias = *(const HVX_UVector *) g_mock_scales;
+    HVX_Vector dealt      = Q6_Vh_vdeal_Vh(scale_bias);
+    scale                 = dealt;
+    bias                  = Q6_V_vror_VR(dealt, 64);
+  }
+  for (int r = 0; r < HMX_FP16_TILE_N_ROWS; r += 2) {
+    HVX_VectorPair acc0 = Q6_W_vcombine_VV(Q6_V_vzero(), Q6_V_vzero());
+    HVX_VectorPair acc1 = Q6_W_vcombine_VV(Q6_V_vzero(), Q6_V_vzero());
+    for (size_t t = 0; t < g_mock_tile_count; ++t) {
+      const __fp16 *a = g_mock_row_tiles[t] + (r / 2) * 64;
+      for (int k = 0; k < HMX_FP16_TILE_N_COLS; ++k) {
+        HVX_Vector weights = Q6_Vh_vdeal_Vh(*(const HVX_UVector *) (g_mock_col_tiles[t] + (k / 2) * 64));
+        if (k & 1) {
+          weights = Q6_V_vror_VR(weights, 64);
         }
+        HVX_Vector a0 = Q6_Vh_vsplat_R(hmx_fp16_bits((float) a[k * 2]));
+        HVX_Vector a1 = Q6_Vh_vsplat_R(hmx_fp16_bits((float) a[k * 2 + 1]));
+        HVX_VectorPair product0 = Q6_Wqf32_vmpy_VhfVhf(a0, weights);
+        HVX_VectorPair product1 = Q6_Wqf32_vmpy_VhfVhf(a1, weights);
+        acc0 = Q6_W_vcombine_VV(Q6_Vqf32_vadd_Vqf32Vqf32(Q6_V_hi_W(acc0), Q6_V_hi_W(product0)),
+                                Q6_Vqf32_vadd_Vqf32Vqf32(Q6_V_lo_W(acc0), Q6_V_lo_W(product0)));
+        acc1 = Q6_W_vcombine_VV(Q6_Vqf32_vadd_Vqf32Vqf32(Q6_V_hi_W(acc1), Q6_V_hi_W(product1)),
+                                Q6_Vqf32_vadd_Vqf32Vqf32(Q6_V_lo_W(acc1), Q6_V_lo_W(product1)));
       }
-      int out_idx = (r / 2) * 64 + c * 2 + (r % 2);
-      float scale = g_mock_scales ? (float)g_mock_scales[hmx_fp16_scale_lane_for_column(c)] : 1.0f;
-      float bias = g_mock_scales ? (float)g_mock_scales[hmx_fp16_bias_lane_for_column(c)] : 0.0f;
-      out[out_idx] = (__fp16)(sum * scale + bias);
     }
+    HVX_Vector row0 = Q6_Vhf_vcvt_VsfVsf(Q6_Vsf_equals_Vqf32(Q6_V_lo_W(acc0)),
+                                          Q6_Vsf_equals_Vqf32(Q6_V_hi_W(acc0)));
+    HVX_Vector row1 = Q6_Vhf_vcvt_VsfVsf(Q6_Vsf_equals_Vqf32(Q6_V_lo_W(acc1)),
+                                          Q6_Vsf_equals_Vqf32(Q6_V_hi_W(acc1)));
+    row0             = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_VhfVhf(Q6_Vhf_vmpy_VhfVhf(row0, scale), bias));
+    row1             = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_VhfVhf(Q6_Vhf_vmpy_VhfVhf(row1, scale), bias));
+    HVX_VectorPair rows = Q6_W_vshuff_VVR(row1, row0, -2);
+    *(HVX_UVector *) (out + (r / 2) * 64) = Q6_V_lo_W(rows);
   }
   g_mock_tile_count = 0;
 #endif

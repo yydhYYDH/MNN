@@ -5,6 +5,7 @@
 struct MapInfo {
     int fd;
     void* ptr;
+    bool release;
 };
 
 #define MAX_MMAP_CACHE_SIZE 512
@@ -41,10 +42,29 @@ MmapManager* mmap_manager_init_local() {
   return manager;
 }
 
+int mmap_manager_register_local(MmapManager* manager, int fd, void* ptr) {
+  if (manager == nullptr || fd < 0 || ptr == nullptr || manager->count >= MAX_MMAP_CACHE_SIZE) {
+    return -1;
+  }
+  for (int i = 0; i < manager->count; ++i) {
+    if (manager->entries[i].fd == fd) {
+      return manager->entries[i].ptr == ptr ? 0 : -1;
+    }
+  }
+  int idx = manager->count++;
+  manager->entries[idx].fd = fd;
+  manager->entries[idx].ptr = ptr;
+  manager->entries[idx].release = false;
+  mmap_manager_remember_hot(manager, fd, ptr);
+  return 0;
+}
+
 void mmap_manager_destroy_local(MmapManager* manager) {
   if (manager) {
     for (int i = 0; i < manager->count; ++i) {
-      HAP_mmap_put(manager->entries[i].fd);
+      if (manager->entries[i].release) {
+        HAP_mmap_put(manager->entries[i].fd);
+      }
     }
     manager->count = 0;
     delete manager;
@@ -87,6 +107,7 @@ void *mmap_manager_get_map_local(MmapManager* manager, int fd) {
     int idx = manager->count++;
     manager->entries[idx].fd = fd;
     manager->entries[idx].ptr = p;
+    manager->entries[idx].release = true;
   }
   mmap_manager_remember_hot(manager, fd, p);
 

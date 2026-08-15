@@ -54,7 +54,9 @@ static void hmx_queue_resource_begin(MNNHmxQueue* queue) {
   if (context_id == 0) {
     return;
   }
+#ifndef SIMULATOR_MOCK_HMX
   HAP_compute_res_hmx_lock(context_id);
+#endif
   hmx_unit_acquire();
 }
 
@@ -67,7 +69,9 @@ static void hmx_queue_resource_end(MNNHmxQueue* queue) {
     return;
   }
   hmx_unit_release();
+#ifndef SIMULATOR_MOCK_HMX
   HAP_compute_res_hmx_unlock(context_id);
+#endif
 }
 
 static void hmx_queue_thread(void* opaque) {

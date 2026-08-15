@@ -290,6 +290,7 @@ option(MNN_QNN_ONLINE_FINALIZE "Enable QNN Online Finalize" ON)
 option(MNN_RKNN "Enable RKNN runtime and converter support" OFF)
 option(MNN_HEXAGON "Enable Hexagon DSP backend" OFF)
 option(MNN_HEXAGON_ASAN "Enable Hexagon backend internal memory consistency checks" OFF)
+option(MNN_HEXAGON_OFFLINE_SIMULATOR "Enable the offline Hexagon simulator test path" OFF)
 
 option(MNN_GPU_TIME_PROFILE "Enable time profiling for the OpenCL backend and Vulkan backend." OFF)
 option(MNN_GPU_PROFILE_SILENT "When GPU time profiling is enabled, only accumulate total time without printing per-kernel details." OFF)

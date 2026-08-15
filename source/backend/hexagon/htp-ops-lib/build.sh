@@ -29,7 +29,12 @@ fi
 if [[ "${HTP_OPS_BUILD_ANDROID:-1}" == "1" ]]; then
     build_cmake android
 fi
-HEXAGON_BUILD_ARGS=(hexagon "DSP_ARCH=${DSP_ARCH}" "HTP_OPS_PWL_VARIANT=${HTP_OPS_PWL_VARIANT:-learned8}")
+HEXAGON_BUILD_ARGS=(
+    hexagon
+    "DSP_ARCH=${DSP_ARCH}"
+    "HTP_OPS_PWL_VARIANT=${HTP_OPS_PWL_VARIANT:-learned8}"
+    "MNN_HEXAGON_OFFLINE_SIMULATOR=${MNN_HEXAGON_OFFLINE_SIMULATOR:-OFF}"
+)
 if [[ "${HTP_OPS_USE_MAKE:-0}" == "1" ]]; then
     HEXAGON_BUILD_ARGS+=("-gMake")
 fi

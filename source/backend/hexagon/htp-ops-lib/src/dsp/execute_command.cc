@@ -770,6 +770,31 @@ int htp_execute_command(MmapManager* mmap_manager, const DSPCOMMAND::Command* co
     return ret;
 }
 
+#ifdef SIMULATOR_MOCK_HMX
+int htp_ops_execute_offline_command(const uint8_t* commandData, const int* bufferIds, void* const* bufferPtrs,
+                                    int bufferCount) {
+    if (commandData == nullptr || bufferIds == nullptr || bufferPtrs == nullptr || bufferCount <= 0) {
+        return AEE_EBADPARM;
+    }
+    MmapManager* manager = mmap_manager_init_local();
+    if (manager == nullptr) {
+        return AEE_ENOMEMORY;
+    }
+    int result = AEE_SUCCESS;
+    for (int i = 0; i < bufferCount; ++i) {
+        if (mmap_manager_register_local(manager, bufferIds[i], bufferPtrs[i]) != 0) {
+            result = AEE_EBADPARM;
+            break;
+        }
+    }
+    if (result == AEE_SUCCESS) {
+        result = htp_execute_command(manager, flatbuffers::GetRoot<DSPCOMMAND::Command>(commandData));
+    }
+    mmap_manager_destroy_local(manager);
+    return result;
+}
+#endif
+
 static int execute_single_command(MmapManager* mmap_manager, int32 cmdFd, int32 cmdOffset, int32 cmdSize, int32 dirty, int* profile = nullptr) {
     void* cmd_base = NULL;
     if ((cmd_base = mmap_manager_get_map_local(mmap_manager, cmdFd)) == NULL) {

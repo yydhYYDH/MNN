@@ -18,6 +18,9 @@ target_compile_definitions(MNN_Hexagon PRIVATE -DMNN_HEXAGON_ENABLED=1)
 if (MNN_HEXAGON_ASAN)
     target_compile_definitions(MNN_Hexagon PRIVATE -DMNN_HEXAGON_ASAN=1)
 endif()
+if (MNN_HEXAGON_OFFLINE_SIMULATOR)
+    target_compile_definitions(MNN_Hexagon PRIVATE -DMNN_HEXAGON_OFFLINE_RPC=1)
+endif()
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64" OR ANDROID_ABI STREQUAL "arm64-v8a")
     set_source_files_properties(
         ${CMAKE_CURRENT_LIST_DIR}/backend/HexagonBackend.cpp

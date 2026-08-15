@@ -9,6 +9,7 @@
 #include "core/BufferAllocator.hpp"
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 namespace MNN {
 // Owns the dlopen handle of the host-side DSP library (libMNN_htpops.so) and
@@ -110,6 +111,22 @@ private:
     mutable std::vector<SyncTensorRecord> mPendingHexagonOutputs;
     mutable std::vector<HexagonBuffer*> mCommandWeightBuffers;
     mutable size_t mCommandWeightBytes = 0;
+#ifdef MNN_HEXAGON_OFFLINE_RPC
+    void recordOfflineCommandGroup() const;
+    void writeOfflineRequest() const;
+    struct OfflineRecordedBuffer {
+        int fd = -1;
+        uint32_t alignment = 2048;
+        uint32_t flags = 0;
+        std::vector<uint8_t> data;
+    };
+    mutable std::string mOfflineRecordPath;
+    mutable uint32_t mOfflineOutputFd = 0;
+    mutable uint32_t mOfflineOutputOffset = 0;
+    mutable uint32_t mOfflineOutputSize = 0;
+    mutable std::vector<std::vector<uint8_t>> mOfflineRecordedCommands;
+    mutable std::vector<OfflineRecordedBuffer> mOfflineRecordedBuffers;
+#endif
 #ifdef MNN_GPU_TIME_PROFILE
     mutable MemChunk mProfileChunk;
     mutable int mProfileFlushCount = 0;
