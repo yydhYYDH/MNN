@@ -25,6 +25,32 @@ static inline int32_t fp32_bits(float value) {
   return bits.i;
 }
 
+static inline float float_from_bits(int32_t value) {
+  union { int32_t i; float f; } bits = { .i = value };
+  return bits.f;
+}
+
+static inline float linear_attention_fast_logf(float x) {
+  if (!(x > 0.0f)) {
+    return -65504.0f;
+  }
+  union { float f; uint32_t u; } v = { .f = x };
+  int e = (int)((v.u >> 23) & 0xff) - 127;
+  v.u = (v.u & 0x007fffffu) | 0x3f800000u;
+  float m = v.f;
+  if (m > 1.41421356237f) {
+    m *= 0.5f;
+    e += 1;
+  }
+  const float t = (m - 1.0f) / (m + 1.0f);
+  const float t2 = t * t;
+  const float t3 = t * t2;
+  const float t5 = t3 * t2;
+  const float t7 = t5 * t2;
+  return 2.0f * (t + t3 * (1.0f / 3.0f) + t5 * (1.0f / 5.0f) + t7 * (1.0f / 7.0f)) +
+         (float)e * 0.69314718056f;
+}
+
 static inline float load_sequence(const uint8_t *data, int b, int d, int t, int batch, int channels, int sequence,
                                   int c4, int pack) {
   const int index = c4 ? c4_offset(b * sequence + t, d, batch * sequence, pack) : (b * channels + d) * sequence + t;
@@ -296,6 +322,8 @@ struct LinearAttentionHeadTask {
   int                 output_c4;
   int                 use_qk_l2norm;
   int                 c4_pack;
+  int                 gate_fold;
+  const int32_t       *gate_fold_params;
   int                 head_begin;
   int                 head_end;
   worker_synctoken_t *sync;
@@ -378,10 +406,17 @@ static void linear_attention_head_range(const LinearAttentionHeadTask *task) {
     }
 
     const int   state_base = ((task->b * task->num_v_heads + h) * task->head_k_dim) * task->head_v_dim;
-    const float decay      = expf(load_token_channel(task->gate, task->b, task->t, h, task->batch, task->num_v_heads,
-                                                     task->sequence, task->gate_c4, task->c4_pack));
-    const float beta_value = load_token_channel(task->beta, task->b, task->t, h, task->batch, task->num_v_heads,
-                                                task->sequence, task->beta_c4, task->c4_pack);
+    float gate_value = load_token_channel(task->gate, task->b, task->t, h, task->batch, task->num_v_heads,
+                                          task->sequence, task->gate_c4, task->c4_pack);
+    float beta_value = load_token_channel(task->beta, task->b, task->t, h, task->batch, task->num_v_heads,
+                                          task->sequence, task->beta_c4, task->c4_pack);
+    if (task->gate_fold) {
+      const float coef = float_from_bits(task->gate_fold_params[h]);
+      const float bias = float_from_bits(task->gate_fold_params[task->num_v_heads + h]);
+      gate_value = coef * linear_attention_fast_logf(1.0f + expf(gate_value + bias));
+      beta_value = 1.0f / (1.0f + expf(-beta_value));
+    }
+    const float decay = expf(gate_value);
     __fp16 hmx_products[512];
     const bool packed_state = linear_attention_uses_packed_state(task->head_k_dim, task->head_v_dim);
     const bool use_hmx      = linear_attention_hmx_matmul(hmx_products, qk_fp16, qk_fp16 + task->head_k_dim,
@@ -508,12 +543,15 @@ extern "C" AEEResult htp_ops_linear_attention_gated_delta(
   int32_t batch, int32_t conv_dim,
   int32_t sequence, int32_t num_k_heads, int32_t num_v_heads, int32_t head_k_dim, int32_t head_v_dim,
   int32_t conv_kernel, int32_t qkv_c4, int32_t gate_c4, int32_t beta_c4, int32_t output_c4, int32_t weight_c4,
-  int32_t use_qk_l2norm, int32_t c4_pack) {
+  int32_t use_qk_l2norm, int32_t c4_pack, int32_t gate_fold, const int32_t *gate_fold_params) {
   if (output == nullptr || conv_output == nullptr || qkv == nullptr || gate == nullptr || beta == nullptr ||
       conv_weight == nullptr || conv_state == nullptr || recurrent_state == nullptr || packed_conv_weight == nullptr ||
       batch <= 0 || conv_dim <= 0 ||
       sequence <= 0 || num_k_heads <= 0 || num_v_heads <= 0 || head_k_dim <= 0 || head_v_dim <= 0 || conv_kernel <= 0 ||
       head_k_dim > 256 || head_v_dim > 256 || num_v_heads % num_k_heads != 0 || c4_pack <= 0) {
+    return AEE_EBADPARM;
+  }
+  if (gate_fold && gate_fold_params == nullptr) {
     return AEE_EBADPARM;
   }
 
@@ -551,7 +589,8 @@ extern "C" AEEResult htp_ops_linear_attention_gated_delta(
       LinearAttentionHeadTask head_task = { output,      conv_output, gate,          beta,       recurrent_state,
                                             b,           t,           batch,         conv_dim,   sequence,
                                             num_k_heads, num_v_heads, head_k_dim,    head_v_dim, gate_c4,
-                                            beta_c4,     output_c4,   use_qk_l2norm, c4_pack,    0,
+                                            beta_c4,     output_c4,   use_qk_l2norm, c4_pack,    gate_fold,
+                                            gate_fold_params, 0,
                                             num_v_heads, nullptr };
       linear_attention_heads_token(head_task);
     }

@@ -3,6 +3,8 @@
 
 #include "HexagonExecution.hpp"
 
+#include <vector>
+
 namespace MNN {
 
 struct KVMeta;
@@ -36,6 +38,9 @@ private:
     bool mOutputC4 = false;
     bool mWeightC4 = false;
     bool mUseQKL2Norm = false;
+    bool mGateFold = false;
+    std::vector<float> mGateCoef;
+    std::vector<float> mGateBias;
     int mPack = 4;
     KVMeta* mMeta = nullptr;
     std::shared_ptr<Tensor> mConvScratch;

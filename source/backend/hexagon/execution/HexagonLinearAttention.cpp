@@ -60,6 +60,17 @@ HexagonLinearAttention::HexagonLinearAttention(Backend* backend, const Op* op, s
         mHeadKDim = param->head_k_dim();
         mHeadVDim = param->head_v_dim();
         mUseQKL2Norm = param->use_qk_l2norm();
+        mGateFold = param->gate_fold();
+        if (mGateFold) {
+            if (param->gate_coef() == nullptr || param->gate_bias() == nullptr ||
+                (int)param->gate_coef()->size() != mNumVHeads || (int)param->gate_bias()->size() != mNumVHeads) {
+                MNN_ERROR("HexagonLinearAttention: gate_fold metadata missing or wrong size\n");
+                mValid = false;
+            } else {
+                mGateCoef.assign(param->gate_coef()->begin(), param->gate_coef()->end());
+                mGateBias.assign(param->gate_bias()->begin(), param->gate_bias()->end());
+            }
+        }
     }
     mPack = static_cast<const HexagonRuntime*>(backend->getRuntime())->info().vectorSize;
     if (mPack <= 0) {
@@ -121,6 +132,9 @@ bool HexagonLinearAttention::onClone(Backend* backend, const Op* op, Execution**
     execution->mOutputC4 = mOutputC4;
     execution->mWeightC4 = mWeightC4;
     execution->mUseQKL2Norm = mUseQKL2Norm;
+    execution->mGateFold = mGateFold;
+    execution->mGateCoef = mGateCoef;
+    execution->mGateBias = mGateBias;
     execution->mPack = mPack;
     execution->mMeta = mMeta;
     *dst = execution;
@@ -208,10 +222,17 @@ ErrorCode HexagonLinearAttention::onBuildCmd(const std::vector<Tensor*>& inputs,
         return OUT_OF_MEMORY;
     }
 
-    int params[] = {mBatch,          mConvDim,          mSequence,         mNumKHeads,           mNumVHeads,
-                    mHeadKDim,       mHeadVDim,         mConvKernel,       mQKVC4 ? 1 : 0,       mGateC4 ? 1 : 0,
-                    mBetaC4 ? 1 : 0, mOutputC4 ? 1 : 0, mWeightC4 ? 1 : 0,
-                    mUseQKL2Norm ? 1 : 0, mPack};
+    std::vector<int> params = {mBatch,          mConvDim,          mSequence,         mNumKHeads,           mNumVHeads,
+                               mHeadKDim,       mHeadVDim,         mConvKernel,       mQKVC4 ? 1 : 0,       mGateC4 ? 1 : 0,
+                               mBetaC4 ? 1 : 0, mOutputC4 ? 1 : 0, mWeightC4 ? 1 : 0,
+                               mUseQKL2Norm ? 1 : 0, mPack, mGateFold ? 1 : 0};
+    if (mGateFold) {
+        const size_t base = params.size();
+        params.resize(base + 2 * mNumVHeads);
+        static_assert(sizeof(int) == sizeof(float), "command parameter size mismatch");
+        ::memcpy(params.data() + base, mGateCoef.data(), mNumVHeads * sizeof(float));
+        ::memcpy(params.data() + base + mNumVHeads, mGateBias.data(), mNumVHeads * sizeof(float));
+    }
     std::vector<std::pair<int, int>> inputFds = {
         HexagonBackend::getDevicePtr(inputs[0]),          HexagonBackend::getDevicePtr(inputs[1]),
         HexagonBackend::getDevicePtr(inputs[2]),          HexagonBackend::getDevicePtr(inputs[3]),
@@ -224,8 +245,8 @@ ErrorCode HexagonLinearAttention::onBuildCmd(const std::vector<Tensor*>& inputs,
                                           mState->recurrent.get(), mState->packedConvWeight.get()};
     std::vector<Tensor*> commandOutputs = {outputs[0], mState->conv.get(), mState->recurrent.get(), mConvScratch.get()};
     dst.emplace_back();
-    dst.back().build(static_cast<HexagonBackend*>(backend()), DSP_OP_LINEAR_ATTENTION_GATED_DELTA, params,
-                     sizeof(params), inputFds, outputFds, commandInputs, commandOutputs);
+    dst.back().build(static_cast<HexagonBackend*>(backend()), DSP_OP_LINEAR_ATTENTION_GATED_DELTA, params.data(),
+                     params.size() * sizeof(int), inputFds, outputFds, commandInputs, commandOutputs);
     backend()->onReleaseBuffer(mConvScratch.get(), Backend::DYNAMIC);
     return NO_ERROR;
 }
