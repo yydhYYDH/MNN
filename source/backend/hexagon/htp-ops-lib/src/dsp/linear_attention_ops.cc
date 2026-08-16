@@ -506,10 +506,7 @@ static void linear_attention_head_worker(void *opaque, int worker_index) {
 }
 
 static void linear_attention_heads_token(const LinearAttentionHeadTask &base) {
-  int task_count = g_max_num_workers > 1 && base.num_v_heads > 1 ? (int) g_max_num_workers : 1;
-  if (task_count > base.num_v_heads) {
-    task_count = base.num_v_heads;
-  }
+  int task_count = g_max_num_workers > 1 && base.num_v_heads > 1 ? base.num_v_heads : 1;
   if (task_count <= 1) {
     LinearAttentionHeadTask task = base;
     task.head_begin              = 0;
@@ -520,7 +517,7 @@ static void linear_attention_heads_token(const LinearAttentionHeadTask &base) {
   LinearAttentionHeadTask *tasks = WORKER_POOL_STACK_ALLOC(LinearAttentionHeadTask, task_count);
   worker_synctoken_t       sync;
   worker_pool_synctoken_init(&sync, task_count);
-  const int heads_per_task = (base.num_v_heads + task_count - 1) / task_count;
+  const int heads_per_task = 1;
   for (int i = 0; i < task_count; ++i) {
     tasks[i]            = base;
     tasks[i].head_begin = i * heads_per_task;
