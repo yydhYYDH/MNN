@@ -26,6 +26,7 @@ class MNNConverter:
             self.mnnconvert = None
         self.lm_weight = None
         self.tie_embeddings_info = None
+        self.gate_fold_ops = set()
 
     def transformer_c4_args(self):
         enabled = getattr(self.args, 'transformer_c4', True)
@@ -180,6 +181,7 @@ class MNNConverter:
             if self.exporter.model_type != 'hunyuan_vl':
                 self.removeDupOps(self.mnn_model_path)
             self.mnn2json(self.mnn_model_path, mnn_json)
+            self.validate_linear_attention_gate_fold(mnn_json)
             if self.args.gptq_path is not None:
                 self.apply_gptq(mnn_json)
             if self.args.lora_path is not None and self.args.lora_split:
@@ -189,6 +191,33 @@ class MNNConverter:
             if self.args.smooth:
                 self.export_smooth_quant(mnn_json)
         return self.tie_embeddings_info
+
+    def validate_linear_attention_gate_fold(self, mnn_json):
+        if not self.gate_fold_ops:
+            return
+        with open(mnn_json, 'rt') as graph_file:
+            graph = json.load(graph_file)
+        pending = set(self.gate_fold_ops)
+        for op in graph.get('oplists', []):
+            param = op.get('main', {})
+            name = op.get('name', '')
+            if name not in pending:
+                continue
+            heads = param.get('num_v_heads', 0)
+            coef = param.get('gate_coef', [])
+            bias = param.get('gate_bias', [])
+            if (op.get('type') != 'LinearAttention' or param.get('attn_type') != 'gated_delta_rule' or
+                    not param.get('gate_fold', False) or len(coef) != heads or len(bias) != heads):
+                raise RuntimeError(
+                    'LinearAttention gate-fold metadata was lost while converting "{}". '
+                    'Use an MNNConvert built from the same source tree, or export with '
+                    '--disable_fuse_linear_attn_gate.'.format(name))
+            pending.remove(name)
+        if pending:
+            raise RuntimeError(
+                'LinearAttention gate-fold ops disappeared while converting: {}. Use an MNNConvert '
+                'built from the same source tree, or export with --disable_fuse_linear_attn_gate.'.format(
+                    ', '.join(sorted(pending))))
 
     def get_experts_graphs(self, experts):
         hidden_states = torch.randn((1, self.exporter.config.hidden_size))
@@ -634,6 +663,7 @@ class MNNConverter:
             linear_attention_param["gate_fold"] = True
             linear_attention_param["gate_coef"] = gate_coef
             linear_attention_param["gate_bias"] = gate_bias
+            self.gate_fold_ops.add(name)
 
         fused_linear_attention = {
             "inputIndexes": input_indexes,
