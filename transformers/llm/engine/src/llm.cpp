@@ -7,6 +7,7 @@
 // #define MNN_OPEN_TIME_TRACE 1
 
 #include <fstream>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
 #include <iomanip>
@@ -33,6 +34,34 @@
 namespace MNN {
 using namespace Express;
 namespace Transformer {
+
+static void dumpTensorForDebug(const char* envName, const VARP& tensor) {
+    const char* path = std::getenv(envName);
+    if (path == nullptr || path[0] == '\0' || tensor == nullptr) {
+        return;
+    }
+    auto info = tensor->getInfo();
+    if (info == nullptr || info->size <= 0 || info->dim.empty()) {
+        return;
+    }
+    const float* data = tensor->readMap<float>();
+    if (data == nullptr) {
+        return;
+    }
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output.is_open()) {
+        MNN_ERROR("[LLM] debug dump cannot open %s\n", path);
+        return;
+    }
+    uint32_t rank = static_cast<uint32_t>(info->dim.size());
+    output.write(reinterpret_cast<const char*>(&rank), sizeof(rank));
+    for (auto dim : info->dim) {
+        int32_t value = static_cast<int32_t>(dim);
+        output.write(reinterpret_cast<const char*>(&value), sizeof(value));
+    }
+    output.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(info->size * sizeof(float)));
+    MNN_PRINT("[LLM] dumped %s: %s (%zu values)\n", envName, path, info->size);
+}
 
 static MNNForwardType backend_type_convert(const std::string& type_str) {
     if (type_str == "cpu")
@@ -581,6 +610,9 @@ std::vector<Express::VARP> Llm::forwardRaw(Express::VARP hiddenState, Express::V
     int seqLenKey = inDecode ? hiddenState->getInfo()->dim[mSeqLenIndex] : mPrefillKey;
     isAllLogists = seqLenKey == 1 ? false : isAllLogists;
     auto moduleKey = std::make_pair(seqLenKey, isAllLogists);
+    if (!inDecode) {
+        dumpTensorForDebug("MNN_LLM_INPUT_DUMP_PATH", hiddenState);
+    }
     std::shared_ptr<Module> selectModule = mModule;
     if (mValidBlockSize.empty()) {
         if(mModulePool.find(moduleKey) == mModulePool.end()) {
@@ -625,6 +657,9 @@ std::vector<Express::VARP> Llm::forwardRaw(Express::VARP hiddenState, Express::V
     }
     if (!mAsync) {
         ((MNN::Tensor*)(outputs[0]->getTensor()))->wait(Tensor::MAP_TENSOR_READ, true);
+    }
+    if (!inDecode) {
+        dumpTensorForDebug("MNN_LLM_LOGITS_DUMP_PATH", outputs[0]);
     }
     mGenerateParam->input_embeds = hiddenState;
     mGenerateParam->outputs = outputs;

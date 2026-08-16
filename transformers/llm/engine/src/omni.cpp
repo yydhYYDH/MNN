@@ -14,6 +14,8 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <fstream>
 #include <iomanip>
 #include <limits>
 #include <random>
@@ -42,6 +44,36 @@
 namespace MNN {
 using namespace Express;
 namespace Transformer {
+
+static void dumpVisionEmbeddingForDebug(const VARP& embedding) {
+    const char* path = std::getenv("MNN_VISION_DUMP_PATH");
+    if (path == nullptr || path[0] == '\0' || embedding == nullptr) {
+        return;
+    }
+    auto info = embedding->getInfo();
+    if (info == nullptr || info->size <= 0 || info->dim.empty()) {
+        MNN_ERROR("[Omni] vision dump skipped: invalid embedding\n");
+        return;
+    }
+    const float* data = embedding->readMap<float>();
+    if (data == nullptr) {
+        MNN_ERROR("[Omni] vision dump skipped: embedding is not readable\n");
+        return;
+    }
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output.is_open()) {
+        MNN_ERROR("[Omni] vision dump cannot open %s\n", path);
+        return;
+    }
+    uint32_t rank = static_cast<uint32_t>(info->dim.size());
+    output.write(reinterpret_cast<const char*>(&rank), sizeof(rank));
+    for (auto dim : info->dim) {
+        int32_t value = static_cast<int32_t>(dim);
+        output.write(reinterpret_cast<const char*>(&value), sizeof(value));
+    }
+    output.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(info->size * sizeof(float)));
+    MNN_PRINT("[Omni] dumped vision embedding: %s (%zu values)\n", path, info->size);
+}
 
 static int roundHalfToEven(float value) {
     float floorValue = std::floor(value);
@@ -1676,6 +1708,9 @@ std::vector<int> Omni::visionProcess(VARP image) {
         for (auto& embd : mVisionEmbeddings) {
             embd->readMap<float>();
         }
+    }
+    if (!mVisionEmbeddings.empty()) {
+        dumpVisionEmbeddingForDebug(mVisionEmbeddings.back());
     }
     mContext->vision_us += _t.durationInUs();
     mContext->pixels_mp += (mVisionWidth / 1000.0f) * (mVisionHeight / 1000.0f);

@@ -30,6 +30,11 @@ public:
 
     int execute(bool forceCopy = false);
 
+    void setQ4DebugWeight(const uint8_t* data, size_t bytes) {
+        mQ4DebugWeight = data;
+        mQ4DebugWeightBytes = bytes;
+    }
+
     void addTensorMap(Tensor* tensor, int index) {
         mInputTensorIndexes.push_back({tensor, index});
         mInputDevicePtrs.emplace_back(-1, -1);
@@ -57,6 +62,8 @@ private:
     bool mDirty = true;
     std::vector<std::pair<int, int>> mInputDevicePtrs;
     std::vector<std::pair<int, int>> mOutputDevicePtrs;
+    const uint8_t* mQ4DebugWeight = nullptr;
+    size_t mQ4DebugWeightBytes = 0;
 };
 
 }

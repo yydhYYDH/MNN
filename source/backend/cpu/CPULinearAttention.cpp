@@ -10,6 +10,8 @@
 
 #include <limits>
 #include <cmath>
+#include <cstdlib>
+#include <fstream>
 #include <vector>
 #include <algorithm>
 #include "CPULinearAttention.hpp"
@@ -1193,6 +1195,23 @@ void CPULinearAttention::gated_delta_rule_decode(const std::vector<Tensor*>& inp
         }
     }
     MNN_CONCURRENCY_END();
+
+    const char* linearDumpPath = std::getenv("MNN_CPU_LINEAR_ATTENTION_DUMP_PATH");
+    if (linearDumpPath != nullptr && linearDumpPath[0] != '\0') {
+        std::ofstream dump(linearDumpPath, std::ios::binary | std::ios::app);
+        if (dump) {
+            const uint32_t magic = 0x434c4144; // CLAD
+            const uint32_t outputBytes = static_cast<uint32_t>(outTensor->size());
+            const uint32_t stateBytes = static_cast<uint32_t>(mStateCache->mRecurrentState->size());
+            const uint32_t bytesPerElement = static_cast<uint32_t>(mBytes);
+            dump.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+            dump.write(reinterpret_cast<const char*>(&bytesPerElement), sizeof(bytesPerElement));
+            dump.write(reinterpret_cast<const char*>(&outputBytes), sizeof(outputBytes));
+            dump.write(reinterpret_cast<const char*>(&stateBytes), sizeof(stateBytes));
+            dump.write(reinterpret_cast<const char*>(outTensor->host<int8_t>()), outputBytes);
+            dump.write(reinterpret_cast<const char*>(mStateCache->mRecurrentState->host<int8_t>()), stateBytes);
+        }
+    }
 }
 
 void CPULinearAttention::short_conv(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) {

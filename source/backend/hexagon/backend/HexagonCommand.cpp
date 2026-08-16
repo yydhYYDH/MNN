@@ -4,6 +4,8 @@
 #include "schema/current/Command_generated.h"
 #include "core/TensorUtils.hpp"
 #include "core/BufferAllocator.hpp"
+#include <cstdlib>
+#include <fstream>
 
 namespace MNN {
 
@@ -35,6 +37,8 @@ HexagonCommand& HexagonCommand::operator=(HexagonCommand&& other) noexcept {
     mOutputTensorIndexes = std::move(other.mOutputTensorIndexes);
     mInputDevicePtrs = std::move(other.mInputDevicePtrs);
     mOutputDevicePtrs = std::move(other.mOutputDevicePtrs);
+    mQ4DebugWeight = other.mQ4DebugWeight;
+    mQ4DebugWeightBytes = other.mQ4DebugWeightBytes;
 
     other.mBackend = nullptr;
     other.mCommandChunk = MemChunk();
@@ -43,6 +47,8 @@ HexagonCommand& HexagonCommand::operator=(HexagonCommand&& other) noexcept {
     other.mOpType = 0;
     other.mLastQueuedSerial = 0;
     other.mDirty = true;
+    other.mQ4DebugWeight = nullptr;
+    other.mQ4DebugWeightBytes = 0;
     return *this;
 }
 
@@ -168,6 +174,46 @@ void HexagonCommand::encode(const std::vector<std::pair<int, int>>& inputFdOffse
 
 int HexagonCommand::execute(bool forceCopy) {
     MNN_ASSERT(mCommandChunk.first != nullptr);
+    const char* q4DumpPath = std::getenv("MNN_HEXAGON_Q4_DUMP_PATH");
+    const char* linearDumpPath = std::getenv("MNN_HEXAGON_LINEAR_ATTENTION_DUMP_PATH");
+    const bool dumpQ4 = q4DumpPath != nullptr && q4DumpPath[0] != '\0' && mOpType == DSP_OP_MATMUL_Q4A16_BLOCK_FP16;
+    const bool dumpLinear = linearDumpPath != nullptr && linearDumpPath[0] != '\0' &&
+                            mOpType == DSP_OP_LINEAR_ATTENTION_GATED_DELTA;
+    const bool dumpDebugOp = dumpQ4 || dumpLinear;
+    const char* dumpPath = dumpQ4 ? q4DumpPath : linearDumpPath;
+    if (dumpDebugOp) {
+        // A producer may still be queued. Flush only in the opt-in debug path so the captured input is current.
+        mBackend->flushCommand();
+        std::ofstream dump(dumpPath, std::ios::binary | std::ios::app);
+        if (dump) {
+            const uint32_t magic = dumpQ4 ? 0x5134444d : 0x4c41444d; // Q4DM / LADM
+            const uint32_t inputCount = static_cast<uint32_t>(mInputTensorIndexes.size());
+            const uint32_t outputCount = static_cast<uint32_t>(mOutputTensorIndexes.size());
+            dump.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+            dump.write(reinterpret_cast<const char*>(&mOpType), sizeof(mOpType));
+            dump.write(reinterpret_cast<const char*>(&inputCount), sizeof(inputCount));
+            dump.write(reinterpret_cast<const char*>(&outputCount), sizeof(outputCount));
+            const uint32_t paramBytes = static_cast<uint32_t>(mParamData.size());
+            dump.write(reinterpret_cast<const char*>(&paramBytes), sizeof(paramBytes));
+            dump.write(reinterpret_cast<const char*>(mParamData.data()), mParamData.size());
+            const uint32_t fdCount = static_cast<uint32_t>(mInputFdOffsets.size());
+            dump.write(reinterpret_cast<const char*>(&fdCount), sizeof(fdCount));
+            for (const auto& fdOffset : mInputFdOffsets) {
+                dump.write(reinterpret_cast<const char*>(&fdOffset.first), sizeof(fdOffset.first));
+                dump.write(reinterpret_cast<const char*>(&fdOffset.second), sizeof(fdOffset.second));
+            }
+            const uint32_t weightBytes = dumpQ4 ? static_cast<uint32_t>(mQ4DebugWeightBytes) : 0;
+            dump.write(reinterpret_cast<const char*>(&weightBytes), sizeof(weightBytes));
+            if (dumpQ4 && mQ4DebugWeight != nullptr && mQ4DebugWeightBytes > 0) {
+                dump.write(reinterpret_cast<const char*>(mQ4DebugWeight), mQ4DebugWeightBytes);
+            }
+            for (const auto& item : mInputTensorIndexes) {
+                const uint32_t bytes = static_cast<uint32_t>(mBackend->getSize(item.first));
+                dump.write(reinterpret_cast<const char*>(&bytes), sizeof(bytes));
+                dump.write(reinterpret_cast<const char*>(HexagonBackend::getPtr(item.first)), bytes);
+            }
+        }
+    }
     bool needPatch = mInputDevicePtrs.size() != mInputTensorIndexes.size() ||
                      mOutputDevicePtrs.size() != mOutputTensorIndexes.size();
     if (!needPatch) {
@@ -235,6 +281,17 @@ int HexagonCommand::execute(bool forceCopy) {
     mBackend->pushCommand(mCommandChunk, (int)mCmdSize, needCopy, dirty);
     mDirty = false;
     mLastQueuedSerial = mBackend->commandSerial();
+    if (dumpDebugOp) {
+        mBackend->flushCommand();
+        std::ofstream dump(dumpPath, std::ios::binary | std::ios::app);
+        if (dump) {
+            for (const auto& item : mOutputTensorIndexes) {
+                const uint32_t bytes = static_cast<uint32_t>(mBackend->getSize(item.first));
+                dump.write(reinterpret_cast<const char*>(&bytes), sizeof(bytes));
+                dump.write(reinterpret_cast<const char*>(HexagonBackend::getPtr(item.first)), bytes);
+            }
+        }
+    }
     return 0;
 }
 

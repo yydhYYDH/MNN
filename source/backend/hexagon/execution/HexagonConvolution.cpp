@@ -800,6 +800,16 @@ ErrorCode HexagonConvolution::onBuildCmd(const std::vector<Tensor *> &inputs, co
         dst.emplace_back();
         dst.back().build(static_cast<HexagonBackend*>(backend()), opType, params, sizeof(params),
                          inputFds,  outputFds,  inputs, outputs);
+        if (useBlock) {
+            const size_t blockWeightBytes = (size_t)icP * ocP * 32 * 16 +
+                                            (size_t)ocP * mResource->int4ScaleBlockNum * 64 * sizeof(uint16_t) +
+                                            (size_t)ocP * UP_DIV(mResource->int4ScaleBlockNum, 2) * 64 * sizeof(uint16_t);
+            const size_t gemvWeightBytes = (size_t)icP * ocP * 512 +
+                                           (size_t)ocP * mResource->int4ScaleBlockNum * 32 * sizeof(float);
+            const MemChunk& debugChunk = pathA ? mResource->gemvI8Weight : mResource->int4Weight;
+            dst.back().setQ4DebugWeight(HexagonBackend::getPtr(debugChunk),
+                                        pathA ? gemvWeightBytes : blockWeightBytes);
+        }
     }
 
     return NO_ERROR;
