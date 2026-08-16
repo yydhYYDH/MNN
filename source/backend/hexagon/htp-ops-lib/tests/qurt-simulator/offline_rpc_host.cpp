@@ -18,6 +18,10 @@ constexpr uint32_t kSize = 32;
 constexpr uint32_t kTopKRowSize = 4097;
 constexpr uint32_t kTopKRows = 2;
 constexpr uint32_t kTopK = 40;
+constexpr uint32_t kQ4BlockM = 1;
+constexpr uint32_t kQ4BlockK = 4096;
+constexpr uint32_t kQ4BlockN = 32;
+constexpr uint32_t kQ4BlockScaleBlocks = 8;
 
 bool writeBytes(std::ofstream &output, const void *data, size_t size) {
   output.write(static_cast<const char *>(data), size);
@@ -84,6 +88,399 @@ int createRequest(const char *path) {
   printf("offline_rpc_host: request=%s m=%u k=%u n=%u bytes=%u\n", path, kSize, kSize, kSize,
          static_cast<unsigned>(sizeof(header) + sizeof(buffers) + sizeof(commandDesc) + builder.GetSize() +
                                activationBytes + weightBytes + vectorBytes + outputBytes));
+  return 0;
+}
+
+uint16_t floatToFp16(float value);
+
+uint8_t q4BlockNibble(uint32_t outputChannel, uint32_t inputChannel) {
+  return static_cast<uint8_t>((outputChannel * 5 + inputChannel * 3) % 16);
+}
+
+float q4BlockActivation(uint32_t inputChannel) {
+  return static_cast<float>(static_cast<int>((inputChannel * 7) % 13) - 6) / 8.0f;
+}
+
+float q4BlockScale(uint32_t outputChannel, uint32_t block) {
+  return 0.25f + static_cast<float>((outputChannel + 3 * block) % 5) / 16.0f;
+}
+
+float q4BlockBias(uint32_t outputChannel) {
+  return static_cast<float>(static_cast<int>(outputChannel % 7) - 3) / 16.0f;
+}
+
+void packQ4BlockWeight(std::vector<uint8_t> &packed) {
+  const uint32_t inputTiles = kQ4BlockK / 32;
+  const uint32_t outputTiles = kQ4BlockN / 32;
+  packed.assign(inputTiles * outputTiles * 512, 0);
+  uint8_t local[32 * 32] = {};
+  uint8_t shuffled[32 * 32] = {};
+  for (uint32_t x = 0; x < inputTiles; ++x) {
+    memset(local, 8, sizeof(local));
+    for (uint32_t yi = 0; yi < 32; ++yi) {
+      for (uint32_t xi = 0; xi < 16; ++xi) {
+        const uint32_t input = x * 32 + xi * 2;
+        const uint8_t  byte = static_cast<uint8_t>((q4BlockNibble(yi, input) << 4) |
+                                                   q4BlockNibble(yi, input + 1));
+        local[2 * xi * 32 + 2 * yi] = byte >> 4;
+        local[2 * xi * 32 + 2 * yi + 1] = byte & 0x0f;
+      }
+    }
+    for (uint32_t q = 0; q < 8; ++q) {
+      const uint8_t *src = local + q * 128;
+      uint8_t       *dst = shuffled + q * 128;
+      for (uint32_t i = 0; i < 64; ++i) {
+        dst[2 * i] = src[i];
+        dst[2 * i + 1] = src[64 + i];
+      }
+    }
+    uint8_t *dstChunk = packed.data() + x * 512;
+    for (uint32_t q = 0; q < 4; ++q) {
+      const uint8_t *low = shuffled + q * 256;
+      const uint8_t *high = low + 128;
+      for (uint32_t i = 0; i < 128; ++i) {
+        dstChunk[q * 128 + i] = (low[i] & 0x0f) | ((high[i] & 0x0f) << 4);
+      }
+    }
+  }
+}
+
+int createQ4BlockRequest(const char *path, const char *referencePath) {
+  const uint32_t weightBytes = (kQ4BlockK / 32) * (kQ4BlockN / 32) * 512;
+  const uint32_t scaleBytes = (kQ4BlockN / 32) * kQ4BlockScaleBlocks * 64 * sizeof(uint16_t);
+  const uint32_t packedScaleBytes = (kQ4BlockN / 32) * ((kQ4BlockScaleBlocks + 1) / 2) * 64 * sizeof(uint16_t);
+  const uint32_t totalWeightBytes = weightBytes + scaleBytes + packedScaleBytes;
+  const uint32_t activationBytes = kQ4BlockK * sizeof(uint16_t);
+  const uint32_t biasBytes = kQ4BlockN * sizeof(uint16_t);
+  const uint32_t outputBytes = kQ4BlockN * sizeof(uint16_t);
+  const OfflineRpcBufferDesc buffers[] = {
+    {301, activationBytes, 128, 0, 1},
+    {302, totalWeightBytes, 128, 0, 1},
+    {303, biasBytes, 128, 0, 1},
+    {304, outputBytes, 128, kOfflineRpcBufferOutput, 1},
+  };
+
+  std::vector<uint16_t> activation(kQ4BlockK);
+  std::vector<uint8_t>  weight;
+  std::vector<uint16_t> bias(kQ4BlockN);
+  std::vector<uint16_t> expected(kQ4BlockN);
+  for (uint32_t input = 0; input < kQ4BlockK; ++input) {
+    activation[input] = floatToFp16(q4BlockActivation(input));
+  }
+  packQ4BlockWeight(weight);
+  weight.resize(totalWeightBytes, 0);
+  uint16_t *scales = reinterpret_cast<uint16_t *>(weight.data() + weightBytes);
+  uint16_t *packedScales = reinterpret_cast<uint16_t *>(weight.data() + weightBytes + scaleBytes);
+  for (uint32_t block = 0; block < kQ4BlockScaleBlocks; ++block) {
+    for (uint32_t output = 0; output < 32; ++output) {
+      scales[block * 64 + 2 * output] = floatToFp16(q4BlockScale(output, block));
+      scales[block * 64 + 2 * output + 1] = scales[block * 64 + 2 * output];
+    }
+  }
+  for (uint32_t pair = 0; pair < (kQ4BlockScaleBlocks + 1) / 2; ++pair) {
+    for (uint32_t output = 0; output < 32; ++output) {
+      packedScales[pair * 64 + 2 * output] = scales[pair * 2 * 64 + 2 * output];
+      packedScales[pair * 64 + 2 * output + 1] =
+          pair * 2 + 1 < kQ4BlockScaleBlocks ? scales[(pair * 2 + 1) * 64 + 2 * output] : 0;
+    }
+  }
+  for (uint32_t output = 0; output < 32; ++output) {
+    bias[output] = floatToFp16(q4BlockBias(output));
+    float result = q4BlockBias(output);
+    for (uint32_t input = 0; input < kQ4BlockK; ++input) {
+      const uint32_t block = input / (kQ4BlockK / kQ4BlockScaleBlocks);
+      const float    weightValue = static_cast<float>(static_cast<int>(q4BlockNibble(output, input)) - 8);
+      result += q4BlockActivation(input) * weightValue * q4BlockScale(output, block);
+    }
+    expected[output] = floatToFp16(result);
+  }
+
+  flatbuffers::FlatBufferBuilder builder;
+  std::vector<flatbuffers::Offset<DSPCOMMAND::Tensor>> inputs = {
+    DSPCOMMAND::CreateTensor(builder, 301, 0, activationBytes),
+    DSPCOMMAND::CreateTensor(builder, 302, 0, totalWeightBytes),
+    DSPCOMMAND::CreateTensor(builder, 303, 0, biasBytes),
+  };
+  std::vector<flatbuffers::Offset<DSPCOMMAND::Tensor>> outputs = {
+    DSPCOMMAND::CreateTensor(builder, 304, 0, outputBytes),
+  };
+  const int32_t params[] = {static_cast<int32_t>(kQ4BlockM), static_cast<int32_t>(kQ4BlockK),
+                            static_cast<int32_t>(kQ4BlockN), 0, 1, 1, 1, static_cast<int32_t>(kQ4BlockK / 32),
+                            static_cast<int32_t>(kQ4BlockScaleBlocks), 0, 0};
+  auto command = DSPCOMMAND::CreateCommand(builder, 34, builder.CreateVector(inputs), builder.CreateVector(outputs),
+                                           builder.CreateVector(params, 11));
+  builder.Finish(command);
+  OfflineRpcRequestHeader header = {
+    kOfflineRpcRequestMagic, kOfflineRpcVersion, 4, 1, {0, 304, 0, outputBytes, 0, 0}
+  };
+  OfflineRpcCommandDesc commandDesc = {static_cast<uint32_t>(builder.GetSize()), 0};
+  const OfflineRpcChunkDesc chunks[] = {{0, activationBytes}, {0, totalWeightBytes}, {0, biasBytes}, {0, outputBytes}};
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  std::ofstream reference(referencePath, std::ios::binary | std::ios::trunc);
+  if (!output || !reference || !writeBytes(output, &header, sizeof(header)) ||
+      !writeBytes(output, buffers, sizeof(buffers)) || !writeBytes(output, &commandDesc, sizeof(commandDesc)) ||
+      !writeBytes(output, builder.GetBufferPointer(), builder.GetSize()) ||
+      !writeBytes(output, &chunks[0], sizeof(chunks[0])) || !writeBytes(output, activation.data(), activationBytes) ||
+      !writeBytes(output, &chunks[1], sizeof(chunks[1])) || !writeBytes(output, weight.data(), totalWeightBytes) ||
+      !writeBytes(output, &chunks[2], sizeof(chunks[2])) || !writeBytes(output, bias.data(), biasBytes) ||
+      !writeBytes(output, &chunks[3], sizeof(chunks[3])) || !writeBytes(output, expected.data(), outputBytes) ||
+      !writeBytes(reference, expected.data(), outputBytes)) {
+    fprintf(stderr, "Unable to write Q4 block oracle: %s\n", path);
+    return 1;
+  }
+  printf("offline_rpc_host: Q4 block request=%s m=%u k=%u n=%u scale_blocks=%u\n", path, kQ4BlockM, kQ4BlockK,
+         kQ4BlockN, kQ4BlockScaleBlocks);
+  return 0;
+}
+
+int extractCommand(const char *inputPath, int commandIndex, const char *outputPath) {
+  std::ifstream input(inputPath, std::ios::binary);
+  OfflineRpcRequestHeader header = {};
+  input.read(reinterpret_cast<char *>(&header), sizeof(header));
+  if (!input || header.magic != kOfflineRpcRequestMagic || commandIndex < 0 ||
+      static_cast<uint32_t>(commandIndex) >= header.commandCount) {
+    return 2;
+  }
+  std::vector<OfflineRpcBufferDesc> buffers(header.bufferCount);
+  std::vector<OfflineRpcCommandDesc> commandDescs(header.commandCount);
+  input.read(reinterpret_cast<char *>(buffers.data()), buffers.size() * sizeof(buffers[0]));
+  input.read(reinterpret_cast<char *>(commandDescs.data()), commandDescs.size() * sizeof(commandDescs[0]));
+  if (!input) {
+    return 3;
+  }
+  std::vector<std::vector<uint8_t>> commands(header.commandCount);
+  for (uint32_t i = 0; i < header.commandCount; ++i) {
+    commands[i].resize(commandDescs[i].size);
+    input.read(reinterpret_cast<char *>(commands[i].data()), commands[i].size());
+  }
+  struct BufferData {
+    OfflineRpcBufferDesc desc;
+    std::vector<uint8_t> data;
+  };
+  std::vector<BufferData> bufferData(header.bufferCount);
+  for (uint32_t i = 0; i < header.bufferCount; ++i) {
+    bufferData[i].desc = buffers[i];
+    bufferData[i].data.resize(buffers[i].logicalSize);
+    std::vector<OfflineRpcChunkDesc> chunks(buffers[i].chunkCount);
+    for (uint32_t j = 0; j < buffers[i].chunkCount; ++j) {
+      input.read(reinterpret_cast<char *>(&chunks[j]), sizeof(chunks[j]));
+      const OfflineRpcChunkDesc &chunk = chunks[j];
+      if (!input || chunk.offset > buffers[i].logicalSize || chunk.size > buffers[i].logicalSize - chunk.offset) {
+        return 4;
+      }
+    }
+    for (const OfflineRpcChunkDesc &chunk : chunks) {
+      input.read(reinterpret_cast<char *>(bufferData[i].data.data() + chunk.offset), chunk.size);
+      if (!input) {
+        return 4;
+      }
+    }
+  }
+  const auto *command = flatbuffers::GetRoot<DSPCOMMAND::Command>(commands[commandIndex].data());
+  if (command == nullptr || command->outputs() == nullptr || command->outputs()->size() == 0) {
+    return 5;
+  }
+  std::vector<int32_t> selectedIds;
+  auto addTensor = [&selectedIds](const DSPCOMMAND::Tensor *tensor) {
+    if (tensor == nullptr || tensor->fd() < 0 ||
+        std::find(selectedIds.begin(), selectedIds.end(), tensor->fd()) != selectedIds.end()) {
+      return;
+    }
+    selectedIds.push_back(tensor->fd());
+  };
+  if (command->inputs() != nullptr) {
+    for (unsigned int i = 0; i < command->inputs()->size(); ++i) {
+      addTensor(command->inputs()->Get(i));
+    }
+  }
+  for (unsigned int i = 0; i < command->outputs()->size(); ++i) {
+    addTensor(command->outputs()->Get(i));
+  }
+  std::vector<BufferData> selected;
+  for (int32_t id : selectedIds) {
+    auto iter = std::find_if(bufferData.begin(), bufferData.end(), [id](const BufferData &buffer) {
+      return buffer.desc.id == id;
+    });
+    if (iter == bufferData.end()) {
+      return 6;
+    }
+    selected.push_back(*iter);
+  }
+  const auto *outputTensor = command->outputs()->Get(0);
+  const int outputFd = outputTensor->fd();
+  const int outputOffset = outputTensor->offset();
+  const int outputBytes = command->params() != nullptr && command->params()->size() > 2
+                              ? command->params()->Get(2) * static_cast<int>(sizeof(uint16_t))
+                              : 0;
+  OfflineRpcRequestHeader outputHeader = {
+    kOfflineRpcRequestMagic, kOfflineRpcVersion, static_cast<uint32_t>(selected.size()), 1,
+    {0, static_cast<uint32_t>(outputFd), static_cast<uint32_t>(outputOffset), static_cast<uint32_t>(outputBytes), 0, 0}
+  };
+  OfflineRpcCommandDesc commandDesc = {static_cast<uint32_t>(commands[commandIndex].size()), 0};
+  std::vector<OfflineRpcBufferDesc> selectedDescs;
+  selectedDescs.reserve(selected.size());
+  for (const auto &buffer : selected) {
+    OfflineRpcBufferDesc desc = buffer.desc;
+    desc.chunkCount           = 1;
+    selectedDescs.push_back(desc);
+  }
+  std::ofstream output(outputPath, std::ios::binary | std::ios::trunc);
+  if (!output || !writeBytes(output, &outputHeader, sizeof(outputHeader)) ||
+      !writeBytes(output, selectedDescs.data(), selectedDescs.size() * sizeof(selectedDescs[0])) ||
+      !writeBytes(output, &commandDesc, sizeof(commandDesc)) ||
+      !writeBytes(output, commands[commandIndex].data(), commands[commandIndex].size())) {
+    return 7;
+  }
+  for (const auto &buffer : selected) {
+    OfflineRpcChunkDesc chunk = {0, buffer.desc.logicalSize};
+    if (!writeBytes(output, &chunk, sizeof(chunk)) || !writeBytes(output, buffer.data.data(), buffer.data.size())) {
+      return 8;
+    }
+  }
+  printf("offline_rpc_host: extracted command=%d type=%u buffers=%zu output_fd=%d offset=%d bytes=%d\n", commandIndex,
+         command->type(), selected.size(), outputFd, outputOffset, outputBytes);
+  return 0;
+}
+
+int extractQ4Compact(const char *inputPath, int commandIndex, const char *outputPath) {
+  std::ifstream input(inputPath, std::ios::binary);
+  OfflineRpcRequestHeader header = {};
+  input.read(reinterpret_cast<char *>(&header), sizeof(header));
+  if (!input || header.magic != kOfflineRpcRequestMagic || commandIndex < 0 ||
+      static_cast<uint32_t>(commandIndex) >= header.commandCount) {
+    return 20;
+  }
+  std::vector<OfflineRpcBufferDesc> buffers(header.bufferCount);
+  std::vector<OfflineRpcCommandDesc> commandDescs(header.commandCount);
+  input.read(reinterpret_cast<char *>(buffers.data()), buffers.size() * sizeof(buffers[0]));
+  input.read(reinterpret_cast<char *>(commandDescs.data()), commandDescs.size() * sizeof(commandDescs[0]));
+  if (!input) {
+    return 21;
+  }
+  std::vector<std::vector<uint8_t>> commands(header.commandCount);
+  for (uint32_t i = 0; i < header.commandCount; ++i) {
+    commands[i].resize(commandDescs[i].size);
+    input.read(reinterpret_cast<char *>(commands[i].data()), commands[i].size());
+  }
+  struct BufferData {
+    OfflineRpcBufferDesc desc;
+    std::vector<uint8_t> data;
+  };
+  std::vector<BufferData> bufferData(header.bufferCount);
+  for (uint32_t i = 0; i < header.bufferCount; ++i) {
+    bufferData[i].desc = buffers[i];
+    bufferData[i].data.resize(buffers[i].logicalSize);
+    std::vector<OfflineRpcChunkDesc> chunks(buffers[i].chunkCount);
+    for (uint32_t j = 0; j < buffers[i].chunkCount; ++j) {
+      input.read(reinterpret_cast<char *>(&chunks[j]), sizeof(chunks[j]));
+      if (!input || chunks[j].offset > buffers[i].logicalSize ||
+          chunks[j].size > buffers[i].logicalSize - chunks[j].offset) {
+        return 22;
+      }
+    }
+    for (const auto &chunk : chunks) {
+      input.read(reinterpret_cast<char *>(bufferData[i].data.data() + chunk.offset), chunk.size);
+      if (!input) {
+        return 22;
+      }
+    }
+  }
+  const auto *source = flatbuffers::GetRoot<DSPCOMMAND::Command>(commands[commandIndex].data());
+  if (source == nullptr || source->type() != 34 || source->inputs() == nullptr || source->inputs()->size() < 2 ||
+      source->outputs() == nullptr || source->outputs()->size() == 0 || source->params() == nullptr ||
+      source->params()->size() < 9) {
+    return 23;
+  }
+  const int32_t m = source->params()->Get(0);
+  const int32_t k = source->params()->Get(1);
+  const int32_t n = source->params()->Get(2);
+  const int32_t scaleBlocks = source->params()->Get(8);
+  if (m <= 0 || k <= 0 || n <= 0 || scaleBlocks <= 0) {
+    return 24;
+  }
+  const size_t activationBytes = static_cast<size_t>(m) * k * sizeof(uint16_t);
+  const size_t outputBytes = static_cast<size_t>(m) * n * sizeof(uint16_t);
+  const size_t icP = (static_cast<size_t>(k) + 31) / 32;
+  const size_t ocP = (static_cast<size_t>(n) + 31) / 32;
+  const size_t weightBytes = icP * ocP * 32 * 16;
+  const size_t scaleBytes = ocP * static_cast<size_t>(scaleBlocks) * 64 * sizeof(uint16_t);
+  const size_t packedScaleBytes = ocP * ((static_cast<size_t>(scaleBlocks) + 1) / 2) * 64 * sizeof(uint16_t);
+  const size_t packedWeightBytes = weightBytes + scaleBytes + packedScaleBytes;
+  auto findBuffer = [&bufferData](int32_t id) -> const BufferData * {
+    for (const auto &buffer : bufferData) {
+      if (buffer.desc.id == id) {
+        return &buffer;
+      }
+    }
+    return nullptr;
+  };
+  auto copyTensor = [&findBuffer](const DSPCOMMAND::Tensor *tensor, size_t bytes, std::vector<uint8_t> *dst) -> bool {
+    if (tensor == nullptr || tensor->fd() < 0 || tensor->offset() < 0) {
+      return false;
+    }
+    const BufferData *buffer = findBuffer(tensor->fd());
+    const size_t offset = static_cast<size_t>(tensor->offset());
+    if (buffer == nullptr || offset > buffer->data.size() || bytes > buffer->data.size() - offset) {
+      return false;
+    }
+    dst->assign(buffer->data.begin() + offset, buffer->data.begin() + offset + bytes);
+    return true;
+  };
+  std::vector<uint8_t> activation;
+  std::vector<uint8_t> weight;
+  if (!copyTensor(source->inputs()->Get(0), activationBytes, &activation) ||
+      !copyTensor(source->inputs()->Get(1), packedWeightBytes, &weight)) {
+    return 25;
+  }
+  const int32_t activationFd = 401;
+  const int32_t weightFd = 402;
+  const int32_t outputFd = 403;
+  flatbuffers::FlatBufferBuilder builder;
+  std::vector<flatbuffers::Offset<DSPCOMMAND::Tensor>> inputs = {
+    DSPCOMMAND::CreateTensor(builder, activationFd, 0, static_cast<int32_t>(activationBytes)),
+    DSPCOMMAND::CreateTensor(builder, weightFd, 0, static_cast<int32_t>(packedWeightBytes)),
+    DSPCOMMAND::CreateTensor(builder, -1, 0, 0)
+  };
+  std::vector<flatbuffers::Offset<DSPCOMMAND::Tensor>> outputs = {
+    DSPCOMMAND::CreateTensor(builder, outputFd, 0, static_cast<int32_t>(outputBytes))
+  };
+  std::vector<int32_t> params;
+  params.reserve(source->params()->size());
+  for (unsigned int i = 0; i < source->params()->size(); ++i) {
+    params.push_back(source->params()->Get(i));
+  }
+  auto command = DSPCOMMAND::CreateCommand(builder, source->type(), builder.CreateVector(inputs),
+                                            builder.CreateVector(outputs), builder.CreateVector(params));
+  builder.Finish(command);
+  std::vector<uint8_t> output(outputBytes, 0);
+  const OfflineRpcBufferDesc outputBuffers[] = {
+    {activationFd, static_cast<uint32_t>(activation.size()), 128, 0, 1},
+    {weightFd, static_cast<uint32_t>(weight.size()), 128, 0, 1},
+    {outputFd, static_cast<uint32_t>(output.size()), 128, kOfflineRpcBufferOutput, 1}
+  };
+  const OfflineRpcRequestHeader outputHeader = {
+    kOfflineRpcRequestMagic, kOfflineRpcVersion, 3, 1,
+    {0, static_cast<uint32_t>(outputFd), 0, static_cast<uint32_t>(outputBytes), 0, 0}
+  };
+  const OfflineRpcCommandDesc outputCommand = {static_cast<uint32_t>(builder.GetSize()), 0};
+  const OfflineRpcChunkDesc activationChunk = {0, static_cast<uint32_t>(activation.size())};
+  const OfflineRpcChunkDesc weightChunk = {0, static_cast<uint32_t>(weight.size())};
+  const OfflineRpcChunkDesc outputChunk = {0, static_cast<uint32_t>(output.size())};
+  std::ofstream outputFile(outputPath, std::ios::binary | std::ios::trunc);
+  if (!outputFile || !writeBytes(outputFile, &outputHeader, sizeof(outputHeader)) ||
+      !writeBytes(outputFile, outputBuffers, sizeof(outputBuffers)) ||
+      !writeBytes(outputFile, &outputCommand, sizeof(outputCommand)) ||
+      !writeBytes(outputFile, builder.GetBufferPointer(), builder.GetSize()) ||
+      !writeBytes(outputFile, &activationChunk, sizeof(activationChunk)) ||
+      !writeBytes(outputFile, activation.data(), activation.size()) ||
+      !writeBytes(outputFile, &weightChunk, sizeof(weightChunk)) ||
+      !writeBytes(outputFile, weight.data(), weight.size()) ||
+      !writeBytes(outputFile, &outputChunk, sizeof(outputChunk)) ||
+      !writeBytes(outputFile, output.data(), output.size())) {
+    return 26;
+  }
+  printf("offline_rpc_host: compact Q4 command=%d m=%d k=%d n=%d scale_blocks=%d bytes=%zu\n", commandIndex, m, k,
+         n, scaleBlocks, activation.size() + weight.size() + output.size());
   return 0;
 }
 
@@ -421,6 +818,15 @@ int inspectRequest(const char *path) {
 }  // namespace
 
 int main(int argc, char **argv) {
+  if (argc == 4 && strcmp(argv[1], "create-q4block") == 0) {
+    return createQ4BlockRequest(argv[2], argv[3]);
+  }
+  if (argc == 5 && strcmp(argv[1], "extract-command") == 0) {
+    return extractCommand(argv[2], atoi(argv[3]), argv[4]);
+  }
+  if (argc == 5 && strcmp(argv[1], "extract-q4compact") == 0) {
+    return extractQ4Compact(argv[2], atoi(argv[3]), argv[4]);
+  }
   if (argc == 3 && strcmp(argv[1], "create-topk") == 0) {
     return createTopKRequest(argv[2]);
   }

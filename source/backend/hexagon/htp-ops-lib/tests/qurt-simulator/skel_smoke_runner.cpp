@@ -21,6 +21,7 @@ static constexpr int kSize          = 32;
 static constexpr int kMeasuredRuns  = 5;
 static constexpr int kMaxBuffers    = 64;
 static constexpr int kMaxCommands   = 4096;
+static constexpr int kMaxChunks     = 4096;
 static uint64        gAverageCycles = 0;
 static uint64        gAverageTicks  = 0;
 static int           gBadResults    = -1;
@@ -89,6 +90,10 @@ static int runOfflineCommand() {
            (unsigned long) header.bufferCount, (long) descs[i].id, (unsigned long) descs[i].logicalSize,
            (unsigned long) descs[i].chunkCount);
     fflush(stdout);
+    if (descs[i].chunkCount > kMaxChunks) {
+      fclose(request);
+      return 8;
+    }
     ids[i]           = descs[i].id;
     uint64 tickStart = HAP_perf_get_qtimer_count();
     ptrs[i]          = memalign(descs[i].alignment, descs[i].logicalSize);
@@ -107,15 +112,19 @@ static int runOfflineCommand() {
     memset(ptrs[i], 0, descs[i].logicalSize);
     memsetTicks += HAP_perf_get_qtimer_count() - tickStart;
     logicalBytes += descs[i].logicalSize;
+    OfflineRpcChunkDesc chunks[kMaxChunks] = {};
     for (uint32_t chunkIndex = 0; chunkIndex < descs[i].chunkCount; ++chunkIndex) {
-      OfflineRpcChunkDesc chunk = {};
       tickStart                 = HAP_perf_get_qtimer_count();
-      const bool readDesc       = readExact(request, &chunk, sizeof(chunk));
+      const bool readDesc       = readExact(request, &chunks[chunkIndex], sizeof(chunks[chunkIndex]));
       freadTicks += HAP_perf_get_qtimer_count() - tickStart;
+      const OfflineRpcChunkDesc &chunk = chunks[chunkIndex];
       if (!readDesc || chunk.offset > descs[i].logicalSize || chunk.size > descs[i].logicalSize - chunk.offset) {
         fclose(request);
         return 8;
       }
+    }
+    for (uint32_t chunkIndex = 0; chunkIndex < descs[i].chunkCount; ++chunkIndex) {
+      const OfflineRpcChunkDesc &chunk = chunks[chunkIndex];
       tickStart           = HAP_perf_get_qtimer_count();
       const bool readData = readExact(request, (uint8_t *) ptrs[i] + chunk.offset, chunk.size);
       freadTicks += HAP_perf_get_qtimer_count() - tickStart;
