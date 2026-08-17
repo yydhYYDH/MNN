@@ -61,7 +61,9 @@ add_library(mnn_htp_qurt_runner SHARED skel_smoke_runner.cpp)
 target_link_libraries(mnn_htp_qurt_runner ${MNN_HTPOPS_SKEL})
 target_compile_options(mnn_htp_qurt_runner PRIVATE -O2)
 target_include_directories(mnn_htp_qurt_runner PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../3rd_party/flatbuffers/include)
 set_target_properties(mnn_htp_qurt_runner PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 

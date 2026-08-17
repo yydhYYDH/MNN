@@ -3,6 +3,8 @@
 #include <fstream>
 #include <limits>
 
+#include "schema/current/Command_generated.h"
+
 namespace {
 
 bool readBytes(std::ifstream* input, void* data, uint64_t size, uint64_t* offset, uint64_t fileSize) {
@@ -10,19 +12,6 @@ bool readBytes(std::ifstream* input, void* data, uint64_t size, uint64_t* offset
         return false;
     }
     input->read(static_cast<char*>(data), static_cast<std::streamsize>(size));
-    if (!*input) {
-        return false;
-    }
-    *offset += size;
-    return true;
-}
-
-bool skipBytes(std::ifstream* input, uint64_t size, uint64_t* offset, uint64_t fileSize) {
-    if (*offset > fileSize || size > fileSize - *offset ||
-        size > static_cast<uint64_t>(std::numeric_limits<std::streamoff>::max())) {
-        return false;
-    }
-    input->seekg(static_cast<std::streamoff>(size), std::ios::cur);
     if (!*input) {
         return false;
     }
@@ -66,13 +55,16 @@ bool readOfflineRpcRequest(const char* path, OfflineRpcRequest* request, bool lo
         if (size == 0 || size > 65536) {
             return false;
         }
-        if (loadCommandData) {
-            request->commandData[i].resize(size);
-            if (!readBytes(&input, request->commandData[i].data(), size, &offset, fileSize)) {
-                return false;
-            }
-        } else if (!skipBytes(&input, size, &offset, fileSize)) {
+        std::vector<uint8_t> commandData(size);
+        if (!readBytes(&input, commandData.data(), size, &offset, fileSize)) {
             return false;
+        }
+        flatbuffers::Verifier verifier(commandData.data(), commandData.size());
+        if (!verifier.VerifyBuffer<DSPCOMMAND::Command>(nullptr)) {
+            return false;
+        }
+        if (loadCommandData) {
+            request->commandData[i] = std::move(commandData);
         }
     }
     for (size_t i = 0; i < request->buffers.size(); ++i) {
@@ -83,12 +75,17 @@ bool readOfflineRpcRequest(const char* path, OfflineRpcRequest* request, bool lo
         }
         for (uint32_t j = 0; j < buffer.chunkCount; ++j) {
             OfflineRpcChunkDesc chunk = {};
-            if (!readBytes(&input, &chunk, sizeof(chunk), &offset, fileSize) ||
-                chunk.size == 0 || chunk.offset > buffer.logicalSize ||
-                chunk.size > buffer.logicalSize - chunk.offset ||
-                !skipBytes(&input, chunk.size, &offset, fileSize)) {
+            if (!readBytes(&input, &chunk, sizeof(chunk), &offset, fileSize) || chunk.size == 0 ||
+                chunk.offset > buffer.logicalSize || chunk.size > buffer.logicalSize - chunk.offset ||
+                offset > fileSize || chunk.size > fileSize - offset ||
+                chunk.size > static_cast<uint64_t>(std::numeric_limits<std::streamoff>::max())) {
                 return false;
             }
+            input.seekg(static_cast<std::streamoff>(chunk.size), std::ios::cur);
+            if (!input) {
+                return false;
+            }
+            offset += chunk.size;
             request->chunks[i].emplace_back(chunk);
         }
     }

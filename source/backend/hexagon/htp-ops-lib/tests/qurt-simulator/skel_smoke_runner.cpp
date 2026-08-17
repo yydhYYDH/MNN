@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "offline_rpc_protocol.h"
+#include "schema/current/Command_generated.h"
 
 extern "C" {
 AEEResult htp_ops_open(const char *uri, remote_handle64 *handle);
@@ -113,6 +114,15 @@ static int runOfflineCommand() {
       fclose(request);
       for (uint32_t j = 0; j <= i; ++j) {
         free(gCommands[j]);
+      }
+      return 7;
+    }
+    flatbuffers::Verifier verifier(gCommands[i], gCommandDescs[i].size);
+    if (!verifier.VerifyBuffer<DSPCOMMAND::Command>(nullptr)) {
+      fclose(request);
+      for (uint32_t j = 0; j <= i; ++j) {
+        free(gCommands[j]);
+        gCommands[j] = nullptr;
       }
       return 7;
     }
