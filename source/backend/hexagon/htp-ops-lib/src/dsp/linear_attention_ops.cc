@@ -514,6 +514,115 @@ static void linear_attention_head_range(const LinearAttentionHeadTask *task) {
   }
 }
 
+static void linear_attention_prefill_head_f32(const LinearAttentionHeadTask *task, int head, __fp16 *packed_state,
+                                              float *state) {
+  const int key_dim = task->num_k_heads * task->head_k_dim;
+  const int kh      = head / (task->num_v_heads / task->num_k_heads);
+  const int q_base  = kh * task->head_k_dim;
+  const int k_base  = q_base + key_dim;
+  const int v_base  = 2 * key_dim + head * task->head_v_dim;
+  for (int i = 0; i < task->head_k_dim; ++i) {
+    for (int j = 0; j < task->head_v_dim; ++j) {
+      state[i * task->head_v_dim + j] =
+        (float) packed_state[linear_attention_packed_state_index(i, j, task->head_k_dim, task->head_v_dim)];
+    }
+  }
+
+  _Alignas(128) float q[256];
+  _Alignas(128) float k[256];
+  _Alignas(128) float predicted[256];
+  _Alignas(128) float queried[256];
+  _Alignas(128) float values[256];
+  _Alignas(128) float delta[256];
+  _Alignas(128) float result[256];
+  for (int t = 0; t < task->sequence; ++t) {
+    float q_norm = 0.0f;
+    float k_norm = 0.0f;
+    for (int i = 0; i < task->head_k_dim; ++i) {
+      q[i] = load_fp16(task->conv_output, t * task->conv_dim + q_base + i);
+      k[i] = load_fp16(task->conv_output, t * task->conv_dim + k_base + i);
+      q_norm += q[i] * q[i];
+      k_norm += k[i] * k[i];
+    }
+    const float q_factor = task->use_qk_l2norm ? (1.0f / sqrtf((float) task->head_k_dim)) /
+                                                 sqrtf(q_norm + 1.0e-6f) : 1.0f;
+    const float k_factor = task->use_qk_l2norm ? 1.0f / sqrtf(k_norm + 1.0e-6f) : 1.0f;
+    float dot = 0.0f;
+    for (int i = 0; i < task->head_k_dim; ++i) {
+      q[i] *= q_factor;
+      k[i] *= k_factor;
+      dot += q[i] * k[i];
+    }
+
+    float gate_value = load_token_channel(task->gate, 0, t, head, 1, task->num_v_heads, task->sequence,
+                                          task->gate_c4, task->c4_pack);
+    float beta_value = load_token_channel(task->beta, 0, t, head, 1, task->num_v_heads, task->sequence,
+                                          task->beta_c4, task->c4_pack);
+    if (task->gate_fold) {
+      const float coef = float_from_bits(task->gate_fold_params[head]);
+      const float bias = float_from_bits(task->gate_fold_params[task->num_v_heads + head]);
+      gate_value       = coef * linear_attention_fast_logf(1.0f + expf(gate_value + bias));
+      beta_value       = 1.0f / (1.0f + expf(-beta_value));
+    }
+    const float decay = expf(gate_value);
+    for (int j = 0; j < task->head_v_dim; ++j) {
+      values[j] = load_fp16(task->conv_output, t * task->conv_dim + v_base + j);
+      predicted[j] = 0.0f;
+      queried[j]   = 0.0f;
+    }
+
+    for (int i = 0; i < task->head_k_dim; ++i) {
+      const HVX_Vector v_k = Q6_V_vsplat_R(fp32_bits(k[i]));
+      const HVX_Vector v_q = Q6_V_vsplat_R(fp32_bits(q[i]));
+      float *row = state + i * task->head_v_dim;
+      for (int j = 0; j < task->head_v_dim; j += 32) {
+        HVX_Vector v_state = vmem(row + j);
+        vmemu(predicted + j) = Q6_Vsf_vadd_VsfVsf(vmemu(predicted + j), Q6_Vsf_vmpy_VsfVsf(v_state, v_k));
+        vmemu(queried + j)   = Q6_Vsf_vadd_VsfVsf(vmemu(queried + j), Q6_Vsf_vmpy_VsfVsf(v_state, v_q));
+      }
+    }
+
+    const HVX_Vector v_decay = Q6_V_vsplat_R(fp32_bits(decay));
+    const HVX_Vector v_beta  = Q6_V_vsplat_R(fp32_bits(beta_value));
+    const HVX_Vector v_dot   = Q6_V_vsplat_R(fp32_bits(dot));
+    for (int j = 0; j < task->head_v_dim; j += 32) {
+      const HVX_Vector v_value = vmemu(values + j);
+      const HVX_Vector v_pred  = vmemu(predicted + j);
+      const HVX_Vector v_query = vmemu(queried + j);
+      const HVX_Vector v_delta = Q6_Vsf_vmpy_VsfVsf(v_beta, Q6_Vsf_vsub_VsfVsf(v_value,
+                                                                                Q6_Vsf_vmpy_VsfVsf(v_decay, v_pred)));
+      vmemu(delta + j) = v_delta;
+      vmemu(result + j) = Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(v_decay, v_query),
+                                             Q6_Vsf_vmpy_VsfVsf(v_dot, v_delta));
+    }
+    for (int j = 0; j < task->head_v_dim; ++j) {
+      if (task->output_c4) {
+        const int token = t * task->num_v_heads + head;
+        store_fp16(task->output, c4_offset(token, j, task->sequence * task->num_v_heads, task->c4_pack), result[j]);
+      } else {
+        store_output(task->output, 0, t, head * task->head_v_dim, 1, task->num_v_heads * task->head_v_dim,
+                     task->sequence, 0, task->c4_pack, result[j]);
+      }
+    }
+    for (int i = 0; i < task->head_k_dim; ++i) {
+      const HVX_Vector v_k = Q6_V_vsplat_R(fp32_bits(k[i]));
+      float *row = state + i * task->head_v_dim;
+      for (int j = 0; j < task->head_v_dim; j += 32) {
+        const HVX_Vector v_state = vmemu(row + j);
+        vmemu(row + j) = Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(v_decay, v_state),
+                                            Q6_Vsf_vmpy_VsfVsf(v_k, vmemu(delta + j)));
+      }
+    }
+  }
+
+  for (int i = 0; i < task->head_k_dim; ++i) {
+    for (int j = 0; j < task->head_v_dim; ++j) {
+      packed_state[linear_attention_packed_state_index(i, j, task->head_k_dim, task->head_v_dim)] =
+        (__fp16) state[i * task->head_v_dim + j];
+    }
+  }
+}
+
 static void linear_attention_head_worker(void *opaque, int worker_index) {
   (void) worker_index;
   LinearAttentionHeadTask *task = (LinearAttentionHeadTask *) opaque;
@@ -546,6 +655,29 @@ static void linear_attention_heads_token(const LinearAttentionHeadTask &base) {
     worker_pool_submit(nullptr, job);
   }
   worker_pool_synctoken_wait(&sync);
+}
+
+static bool linear_attention_prefill_f32(const LinearAttentionHeadTask &base) {
+  if (base.batch != 1 || base.sequence <= 1 || base.head_k_dim != base.head_v_dim ||
+      !linear_attention_uses_packed_state(base.head_k_dim, base.head_v_dim)) {
+    return false;
+  }
+  const size_t state_bytes = (size_t) base.head_k_dim * base.head_v_dim * sizeof(float);
+  const size_t aligned_state_bytes = (state_bytes + 127) & ~(size_t)127;
+  if (vtcm_manager_get_vtcm_base() == nullptr || vtcm_manager_get_vtcm_size() < aligned_state_bytes) {
+    return false;
+  }
+  uint8_t *vtcm = (uint8_t *) vtcm_manager_get_vtcm_base();
+  float *state = (float *) vtcm_seq_alloc(&vtcm, state_bytes);
+  for (int h = 0; h < base.num_v_heads; ++h) {
+    LinearAttentionHeadTask task = base;
+    task.head_begin              = h;
+    task.head_end                = h + 1;
+    __fp16 *packed_state = (__fp16 *) base.recurrent_state +
+                           (size_t) h * base.head_k_dim * base.head_v_dim;
+    linear_attention_prefill_head_f32(&task, h, packed_state, state);
+  }
+  return true;
 }
 
 }  // namespace
@@ -592,6 +724,24 @@ extern "C" AEEResult htp_ops_linear_attention_gated_delta(
   const uint8_t *command_conv_weight =
     use_packed_conv_weight ? packed_conv_weight + kPackedConvWeightHeaderBytes : conv_weight;
   const int command_weight_c4 = use_packed_conv_weight ? 1 : weight_c4;
+  const size_t prefill_state_bytes = (size_t) head_k_dim * head_v_dim * sizeof(float);
+  const bool use_prefill_f32 = batch == 1 && sequence > 1 && head_k_dim == head_v_dim &&
+                               linear_attention_uses_packed_state(head_k_dim, head_v_dim) &&
+                               vtcm_manager_get_vtcm_base() != nullptr &&
+                               vtcm_manager_get_vtcm_size() >= ((prefill_state_bytes + 127) & ~(size_t)127);
+  if (use_prefill_f32) {
+    for (int t = 0; t < sequence; ++t) {
+      linear_attention_convolution_token(conv_output, qkv, command_conv_weight, conv_state, 0, t, batch, conv_dim,
+                                         sequence, conv_kernel, qkv_c4, command_weight_c4, c4_pack);
+    }
+    LinearAttentionHeadTask head_task = {
+      output,    conv_output,   gate,        beta,        recurrent_state, 0,          0,           batch,
+      conv_dim,  sequence,      num_k_heads, num_v_heads, head_k_dim,       head_v_dim, gate_c4,     beta_c4,
+      output_c4, use_qk_l2norm, c4_pack,     gate_fold,   gate_fold_params, 0,          num_v_heads, nullptr
+    };
+    linear_attention_prefill_f32(head_task);
+    return AEE_SUCCESS;
+  }
   for (int b = 0; b < batch; ++b) {
     for (int t = 0; t < sequence; ++t) {
       linear_attention_convolution_token(conv_output, qkv, command_conv_weight, conv_state, b, t, batch, conv_dim,
