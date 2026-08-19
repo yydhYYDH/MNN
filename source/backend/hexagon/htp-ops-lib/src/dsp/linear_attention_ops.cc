@@ -538,20 +538,65 @@ static void linear_attention_prefill_head_f32(const LinearAttentionHeadTask *tas
   for (int t = 0; t < task->sequence; ++t) {
     float q_norm = 0.0f;
     float k_norm = 0.0f;
-    for (int i = 0; i < task->head_k_dim; ++i) {
-      q[i] = load_fp16(task->conv_output, t * task->conv_dim + q_base + i);
-      k[i] = load_fp16(task->conv_output, t * task->conv_dim + k_base + i);
-      q_norm += q[i] * q[i];
-      k_norm += k[i] * k[i];
+    const bool hvx_qk = (task->head_k_dim & 63) == 0;
+    if (hvx_qk) {
+      _Alignas(128) float q_sq[256];
+      _Alignas(128) float k_sq[256];
+      for (int i = 0; i < task->head_k_dim; i += 64) {
+        const HVX_VectorPair q_sf =
+          Q6_Wsf_vcvt_Vhf(Q6_Vh_vshuff_Vh(vmemu((const __fp16 *) task->conv_output + t * task->conv_dim + q_base + i)));
+        const HVX_VectorPair k_sf =
+          Q6_Wsf_vcvt_Vhf(Q6_Vh_vshuff_Vh(vmemu((const __fp16 *) task->conv_output + t * task->conv_dim + k_base + i)));
+        vmemu(q + i)         = Q6_V_lo_W(q_sf);
+        vmemu(q + i + 32)    = Q6_V_hi_W(q_sf);
+        vmemu(k + i)         = Q6_V_lo_W(k_sf);
+        vmemu(k + i + 32)    = Q6_V_hi_W(k_sf);
+        vmemu(q_sq + i)      = Q6_Vsf_vmpy_VsfVsf(Q6_V_lo_W(q_sf), Q6_V_lo_W(q_sf));
+        vmemu(q_sq + i + 32) = Q6_Vsf_vmpy_VsfVsf(Q6_V_hi_W(q_sf), Q6_V_hi_W(q_sf));
+        vmemu(k_sq + i)      = Q6_Vsf_vmpy_VsfVsf(Q6_V_lo_W(k_sf), Q6_V_lo_W(k_sf));
+        vmemu(k_sq + i + 32) = Q6_Vsf_vmpy_VsfVsf(Q6_V_hi_W(k_sf), Q6_V_hi_W(k_sf));
+      }
+      for (int i = 0; i < task->head_k_dim; ++i) {
+        q_norm += q_sq[i];
+        k_norm += k_sq[i];
+      }
+    } else {
+      for (int i = 0; i < task->head_k_dim; ++i) {
+        q[i] = load_fp16(task->conv_output, t * task->conv_dim + q_base + i);
+        k[i] = load_fp16(task->conv_output, t * task->conv_dim + k_base + i);
+        q_norm += q[i] * q[i];
+        k_norm += k[i] * k[i];
+      }
     }
     const float q_factor = task->use_qk_l2norm ? (1.0f / sqrtf((float) task->head_k_dim)) /
                                                  sqrtf(q_norm + 1.0e-6f) : 1.0f;
     const float k_factor = task->use_qk_l2norm ? 1.0f / sqrtf(k_norm + 1.0e-6f) : 1.0f;
     float dot = 0.0f;
-    for (int i = 0; i < task->head_k_dim; ++i) {
-      q[i] *= q_factor;
-      k[i] *= k_factor;
-      dot += q[i] * k[i];
+    if (hvx_qk) {
+      _Alignas(128) float qk_products[256];
+      const HVX_Vector v_q_factor = Q6_V_vsplat_R(fp32_bits(q_factor));
+      const HVX_Vector v_k_factor = Q6_V_vsplat_R(fp32_bits(k_factor));
+      for (int i = 0; i < task->head_k_dim; i += 64) {
+        const HVX_Vector q0 = Q6_Vsf_vmpy_VsfVsf(vmemu(q + i), v_q_factor);
+        const HVX_Vector q1 = Q6_Vsf_vmpy_VsfVsf(vmemu(q + i + 32), v_q_factor);
+        const HVX_Vector k0 = Q6_Vsf_vmpy_VsfVsf(vmemu(k + i), v_k_factor);
+        const HVX_Vector k1 = Q6_Vsf_vmpy_VsfVsf(vmemu(k + i + 32), v_k_factor);
+        vmemu(q + i)        = q0;
+        vmemu(q + i + 32)   = q1;
+        vmemu(k + i)        = k0;
+        vmemu(k + i + 32)   = k1;
+        vmemu(qk_products + i)      = Q6_Vsf_vmpy_VsfVsf(q0, k0);
+        vmemu(qk_products + i + 32) = Q6_Vsf_vmpy_VsfVsf(q1, k1);
+      }
+      for (int i = 0; i < task->head_k_dim; ++i) {
+        dot += qk_products[i];
+      }
+    } else {
+      for (int i = 0; i < task->head_k_dim; ++i) {
+        q[i] *= q_factor;
+        k[i] *= k_factor;
+        dot += q[i] * k[i];
+      }
     }
 
     float gate_value = load_token_channel(task->gate, 0, t, head, 1, task->num_v_heads, task->sequence,
