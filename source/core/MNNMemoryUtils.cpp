@@ -9,6 +9,7 @@
 #include "core/MNNMemoryUtils.h"
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include "core/Macro.h"
 //#define MNN_DEBUG_MEMORY
 static inline void **alignPointer(void **ptr, size_t alignment) {
@@ -20,6 +21,12 @@ extern "C" void *MNNMemoryAllocAlign(size_t size, size_t alignment) {
 
 #ifdef MNN_DEBUG_MEMORY
     return malloc(size);
+#elif defined(__ANDROID__)
+    void* aligned = NULL;
+    if (posix_memalign(&aligned, alignment, size) != 0) {
+        return NULL;
+    }
+    return aligned;
 #else
     void **origin = (void **)malloc(size + sizeof(void *) + alignment);
     MNN_ASSERT(origin != NULL);
@@ -38,6 +45,13 @@ extern "C" void *MNNMemoryCallocAlign(size_t size, size_t alignment) {
 
 #ifdef MNN_DEBUG_MEMORY
     return calloc(size, 1);
+#elif defined(__ANDROID__)
+    void* aligned = NULL;
+    if (posix_memalign(&aligned, alignment, size) != 0) {
+        return NULL;
+    }
+    memset(aligned, 0, size);
+    return aligned;
 #else
     void **origin = (void **)calloc(size + sizeof(void *) + alignment, 1);
     MNN_ASSERT(origin != NULL)
@@ -52,6 +66,8 @@ extern "C" void *MNNMemoryCallocAlign(size_t size, size_t alignment) {
 
 extern "C" void MNNMemoryFreeAlign(void *aligned) {
 #ifdef MNN_DEBUG_MEMORY
+    free(aligned);
+#elif defined(__ANDROID__)
     free(aligned);
 #else
     if (aligned) {
