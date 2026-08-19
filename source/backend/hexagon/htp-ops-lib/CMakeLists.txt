@@ -77,6 +77,7 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/cast_ops.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/eltwise_ops.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/lstm_ops.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/linear_attention_ops.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/topk_ops.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/softmax_ops.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/loop_ops.cc

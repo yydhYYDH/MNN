@@ -1690,17 +1690,27 @@ static void fill_weight_tiles_fp16(__fp16* vtcm_weight, const __fp16* src_weight
     }
 
     static const int kMaxWeightDmaDescs = 64;
+    static const size_t kMaxWeightDmaBytes = 256 * 1024;
+    int tilesPerDesc = (int)(kMaxWeightDmaBytes / bytesPerTile);
+    if (tilesPerDesc < 1) {
+        tilesPerDesc = 1;
+    }
     _Alignas(64) dma_desc_1d_t descs[kMaxWeightDmaDescs];
-    for (int base = 0; base < tileCount; base += kMaxWeightDmaDescs) {
-        int count = tileCount - base;
+    for (int base = 0; base < tileCount; base += kMaxWeightDmaDescs * tilesPerDesc) {
+        int remaining = tileCount - base;
+        int count = (remaining + tilesPerDesc - 1) / tilesPerDesc;
         if (count > kMaxWeightDmaDescs) {
             count = kMaxWeightDmaDescs;
         }
         for (int i = 0; i < count; ++i) {
-            const int tile = base + i;
+            const int tile = base + i * tilesPerDesc;
+            int descTileCount = tileCount - tile;
+            if (descTileCount > tilesPerDesc) {
+                descTileCount = tilesPerDesc;
+            }
             memset(&descs[i], 0, sizeof(descs[i]));
             descs[i].next = (i + 1 < count) ? (uint32_t)&descs[i + 1] : 0;
-            descs[i].length = (uint32_t)bytesPerTile;
+            descs[i].length = (uint32_t)(bytesPerTile * descTileCount);
             descs[i].type = DMA_DESC_TYPE_1D;
             descs[i].src_bypass = 1;
             descs[i].dst_bypass = 1;

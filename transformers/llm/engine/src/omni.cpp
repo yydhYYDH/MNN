@@ -14,6 +14,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <fstream>
 #include <iomanip>
 #include <limits>
 #include <random>

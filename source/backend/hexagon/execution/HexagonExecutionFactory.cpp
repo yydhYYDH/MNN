@@ -14,6 +14,7 @@
 #include "HexagonLayerNorm.hpp"
 #include "HexagonRoPE.hpp"
 #include "HexagonAttention.hpp"
+#include "HexagonLinearAttention.hpp"
 #include "HexagonSelect.hpp"
 #include "HexagonTopKV2.hpp"
 #include "HexagonSoftmax.hpp"
@@ -105,6 +106,9 @@ Execution* HexagonExecutionFactory::create(const Op* op, const std::vector<Tenso
             return HexagonRoPE::create(backend, op);
         case OpType_Attention:
             execution = HexagonAttention::create(backend, op);
+            break;
+        case OpType_LinearAttention:
+            execution = HexagonLinearAttention::create(backend, op);
             break;
         case OpType_Select:
             execution = HexagonSelect::create(backend, op);

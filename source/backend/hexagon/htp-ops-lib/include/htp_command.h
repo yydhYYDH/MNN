@@ -77,6 +77,11 @@ enum DSPOpType {
   DSP_OP_VISION_ATTENTION_FP16                = 43,
   DSP_OP_VISION_FLASH_ATTENTION_FP16          = 44,
   DSP_OP_MATMUL_W8A16_GEMV_I8                 = 45,
+  // Qwen3.5 gated-delta linear attention. The command owns both the
+  // depthwise-convolution state and recurrent state update on the DSP.
+  DSP_OP_LINEAR_ATTENTION_GATED_DELTA         = 46,
+  // Keep this in the previously unused range so existing command ids stay stable.
+  DSP_OP_TOPKV2_FP16                          = 53,
   DSP_OP_COMMAND_GROUP                        = 99,
   DSP_OP_MAX                                  = 100
 };

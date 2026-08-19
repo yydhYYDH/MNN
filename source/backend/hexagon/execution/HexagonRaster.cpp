@@ -6,6 +6,7 @@
 #include "core/OpCommonUtils.hpp"
 #include "backend/hexagon/htp-ops-lib/include/htp_command.h"
 #include <algorithm>
+#include <limits>
 namespace MNN {
 //#define HEXAGON_DEBUG
 
@@ -27,6 +28,54 @@ static int computeArea(const Tensor* tensor) {
         area *= tensor->length(d);
     }
     return area;
+}
+
+static bool isFullLinearC4Reshape(const Tensor::InsideDescribe::Region& region, const Tensor* output, int pack) {
+    const Tensor* origin = region.origin;
+    if (origin == nullptr || pack <= 0 || origin->dimensions() <= 1 || origin->dimensions() > 4 ||
+        output->dimensions() <= 1 || output->dimensions() > 4) {
+        return false;
+    }
+    const auto* originDes = TensorUtils::getDescribe(origin);
+    const auto* outputDes = TensorUtils::getDescribe(output);
+    if (originDes == nullptr || outputDes == nullptr || originDes->dimensionFormat != MNN_DATA_FORMAT_NC4HW4 ||
+        outputDes->dimensionFormat != MNN_DATA_FORMAT_NC4HW4) {
+        return false;
+    }
+    if (origin->channel() % pack != 0 || output->channel() % pack != 0 || region.src.offset != 0 ||
+        region.dst.offset != 0 || !TensorUtils::isCopyRegion(region)) {
+        return false;
+    }
+    const size_t regionSize = static_cast<size_t>(region.size[0]) * region.size[1] * region.size[2];
+    const size_t originSize = TensorUtils::getRawSize(origin);
+    const size_t outputSize = TensorUtils::getRawSize(output);
+    if (regionSize != originSize || regionSize != outputSize) {
+        return false;
+    }
+    return origin->batch() != output->batch() || origin->channel() != output->channel() ||
+           computeArea(origin) != computeArea(output);
+}
+
+static bool turnLinearC4ReshapeToRaster(const Tensor::InsideDescribe::Region& slice, const Tensor* output, int pack,
+                                        HexagonRaster::RasterRegion& region) {
+    const Tensor* origin = slice.origin;
+    if (!isFullLinearC4Reshape(slice, output, pack) || origin->batch() != 1 || computeArea(origin) != 1 ||
+        computeArea(output) != 1) {
+        return false;
+    }
+    region.srcIndex = 0;
+    region.srcOffset = 0;
+    region.dstOffset = 0;
+    region.size[0] = output->channel() / pack;
+    region.size[1] = output->batch();
+    region.size[2] = pack;
+    region.srcStride[0] = pack;
+    region.srcStride[1] = output->channel();
+    region.srcStride[2] = 1;
+    region.dstStride[0] = output->batch() * pack;
+    region.dstStride[1] = pack;
+    region.dstStride[2] = 1;
+    return true;
 }
 
 static bool turnArea1ChannelSliceToC4Regions(const Tensor::InsideDescribe::Region& slice, const Tensor* output,
@@ -145,6 +194,9 @@ void HexagonRaster::releaseDynamicTemps() {
     if (mTempOutput && TensorUtils::getDescribeOrigin(mTempOutput.get())->mem.get() != nullptr) {
         backend()->onReleaseBuffer(mTempOutput.get(), Backend::DYNAMIC);
     }
+    if (mC4ReshapeTemp && TensorUtils::getDescribeOrigin(mC4ReshapeTemp.get())->mem.get() != nullptr) {
+        backend()->onReleaseBuffer(mC4ReshapeTemp.get(), Backend::DYNAMIC);
+    }
 }
 
 ErrorCode HexagonRaster::onBuildCmd(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
@@ -164,6 +216,7 @@ ErrorCode HexagonRaster::onBuildCmd(const std::vector<Tensor*>& inputs, const st
     mTempInput.clear();
     mCacheRegions.clear();
     mTempOutput = nullptr;
+    mC4ReshapeTemp = nullptr;
     mTempInputCopy.clear();
 
     mSingleConvert.type = 0;
@@ -211,6 +264,51 @@ ErrorCode HexagonRaster::onBuildCmd(const std::vector<Tensor*>& inputs, const st
     }
     mRegionCount = (int)des->regions.size();
     if (mRegionCount == 0) {
+        return NO_ERROR;
+    }
+
+    HexagonRaster::RasterRegion linearC4Region;
+    if (mRegionCount == 1 && turnLinearC4ReshapeToRaster(des->regions[0], output, pack, linearC4Region)) {
+        struct SingleRasterParam {
+            int regionCount;
+            int bytes;
+            int srcNumber;
+            HexagonRaster::RasterRegion region;
+        } __attribute__((packed));
+        SingleRasterParam params = {1, mBytes, 1, linearC4Region};
+        auto* origin = des->regions[0].origin;
+        dst.emplace_back();
+        dst.back().build(hexagonBackend, DSP_OP_RASTER_BLIT, &params, sizeof(params),
+                         {HexagonBackend::getDevicePtr(origin)}, {HexagonBackend::getDevicePtr(output)}, {origin},
+                         {output});
+        return NO_ERROR;
+    }
+
+    if (mRegionCount == 1 && isFullLinearC4Reshape(des->regions[0], output, pack)) {
+        auto* origin = des->regions[0].origin;
+        const size_t tempBytes = TensorUtils::getRawSize(origin) * mBytes;
+        if (tempBytes > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            return NOT_SUPPORT;
+        }
+        mC4ReshapeTemp.reset(Tensor::createDevice<int8_t>({static_cast<int>(tempBytes)}));
+        if (!backend()->onAcquireBuffer(mC4ReshapeTemp.get(), Backend::DYNAMIC)) {
+            mC4ReshapeTemp.reset();
+            return OUT_OF_MEMORY;
+        }
+
+        const auto srcDev = HexagonBackend::getDevicePtr(origin);
+        const auto tempDev = HexagonBackend::getDevicePtr(mC4ReshapeTemp.get());
+        const auto dstDev = HexagonBackend::getDevicePtr(output);
+        int unpackParams[] = {origin->batch(), computeArea(origin), origin->channel(), mBytes, 0};
+        int packParams[] = {output->batch(), computeArea(output), output->channel(), mBytes, 1};
+
+        dst.emplace_back();
+        dst.back().build(hexagonBackend, DSP_OP_TENSOR_CONVERT, unpackParams, sizeof(unpackParams), {srcDev}, {tempDev},
+                         {origin}, {mC4ReshapeTemp.get()});
+        dst.emplace_back();
+        dst.back().build(hexagonBackend, DSP_OP_TENSOR_CONVERT, packParams, sizeof(packParams), {tempDev}, {dstDev},
+                         {mC4ReshapeTemp.get()}, {output});
+        backend()->onReleaseBuffer(mC4ReshapeTemp.get(), Backend::DYNAMIC);
         return NO_ERROR;
     }
 
