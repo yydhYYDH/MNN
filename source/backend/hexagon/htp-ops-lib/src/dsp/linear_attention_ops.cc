@@ -616,20 +616,32 @@ static void linear_attention_prefill_head_f32(const LinearAttentionHeadTask *tas
       queried[j]   = 0.0f;
     }
 
-    for (int i = 0; i < task->head_k_dim; i += 2) {
+    for (int i = 0; i < task->head_k_dim; i += 4) {
       const HVX_Vector v_k0 = Q6_V_vsplat_R(fp32_bits(k[i]));
       const HVX_Vector v_q0 = Q6_V_vsplat_R(fp32_bits(q[i]));
       const HVX_Vector v_k1 = Q6_V_vsplat_R(fp32_bits(k[i + 1]));
       const HVX_Vector v_q1 = Q6_V_vsplat_R(fp32_bits(q[i + 1]));
+      const HVX_Vector v_k2 = Q6_V_vsplat_R(fp32_bits(k[i + 2]));
+      const HVX_Vector v_q2 = Q6_V_vsplat_R(fp32_bits(q[i + 2]));
+      const HVX_Vector v_k3 = Q6_V_vsplat_R(fp32_bits(k[i + 3]));
+      const HVX_Vector v_q3 = Q6_V_vsplat_R(fp32_bits(q[i + 3]));
       float *row0 = state + i * task->head_v_dim;
       float *row1 = row0 + task->head_v_dim;
+      float *row2 = row1 + task->head_v_dim;
+      float *row3 = row2 + task->head_v_dim;
       for (int j = 0; j < task->head_v_dim; j += 32) {
         const HVX_Vector v_state0 = vmem(row0 + j);
         const HVX_Vector v_state1 = vmem(row1 + j);
+        const HVX_Vector v_state2 = vmem(row2 + j);
+        const HVX_Vector v_state3 = vmem(row3 + j);
         vmemu(predicted + j) = Q6_Vsf_vadd_VsfVsf(vmemu(predicted + j), Q6_Vsf_vmpy_VsfVsf(v_state0, v_k0));
         vmemu(predicted + j) = Q6_Vsf_vadd_VsfVsf(vmemu(predicted + j), Q6_Vsf_vmpy_VsfVsf(v_state1, v_k1));
+        vmemu(predicted + j) = Q6_Vsf_vadd_VsfVsf(vmemu(predicted + j), Q6_Vsf_vmpy_VsfVsf(v_state2, v_k2));
+        vmemu(predicted + j) = Q6_Vsf_vadd_VsfVsf(vmemu(predicted + j), Q6_Vsf_vmpy_VsfVsf(v_state3, v_k3));
         vmemu(queried + j)   = Q6_Vsf_vadd_VsfVsf(vmemu(queried + j), Q6_Vsf_vmpy_VsfVsf(v_state0, v_q0));
         vmemu(queried + j)   = Q6_Vsf_vadd_VsfVsf(vmemu(queried + j), Q6_Vsf_vmpy_VsfVsf(v_state1, v_q1));
+        vmemu(queried + j)   = Q6_Vsf_vadd_VsfVsf(vmemu(queried + j), Q6_Vsf_vmpy_VsfVsf(v_state2, v_q2));
+        vmemu(queried + j)   = Q6_Vsf_vadd_VsfVsf(vmemu(queried + j), Q6_Vsf_vmpy_VsfVsf(v_state3, v_q3));
       }
     }
 
@@ -655,18 +667,28 @@ static void linear_attention_prefill_head_f32(const LinearAttentionHeadTask *tas
                      task->sequence, 0, task->c4_pack, result[j]);
       }
     }
-    for (int i = 0; i < task->head_k_dim; i += 2) {
+    for (int i = 0; i < task->head_k_dim; i += 4) {
       const HVX_Vector v_k0 = Q6_V_vsplat_R(fp32_bits(k[i]));
       const HVX_Vector v_k1 = Q6_V_vsplat_R(fp32_bits(k[i + 1]));
+      const HVX_Vector v_k2 = Q6_V_vsplat_R(fp32_bits(k[i + 2]));
+      const HVX_Vector v_k3 = Q6_V_vsplat_R(fp32_bits(k[i + 3]));
       float *row0 = state + i * task->head_v_dim;
       float *row1 = row0 + task->head_v_dim;
+      float *row2 = row1 + task->head_v_dim;
+      float *row3 = row2 + task->head_v_dim;
       for (int j = 0; j < task->head_v_dim; j += 32) {
         const HVX_Vector v_state0 = vmemu(row0 + j);
         const HVX_Vector v_state1 = vmemu(row1 + j);
+        const HVX_Vector v_state2 = vmemu(row2 + j);
+        const HVX_Vector v_state3 = vmemu(row3 + j);
         vmemu(row0 + j) = Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(v_decay, v_state0),
                                              Q6_Vsf_vmpy_VsfVsf(v_k0, vmemu(delta + j)));
         vmemu(row1 + j) = Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(v_decay, v_state1),
                                              Q6_Vsf_vmpy_VsfVsf(v_k1, vmemu(delta + j)));
+        vmemu(row2 + j) = Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(v_decay, v_state2),
+                                             Q6_Vsf_vmpy_VsfVsf(v_k2, vmemu(delta + j)));
+        vmemu(row3 + j) = Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(v_decay, v_state3),
+                                             Q6_Vsf_vmpy_VsfVsf(v_k3, vmemu(delta + j)));
       }
     }
   }
