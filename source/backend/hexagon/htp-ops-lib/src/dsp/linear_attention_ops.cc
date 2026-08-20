@@ -160,28 +160,36 @@ static inline bool linear_attention_uses_packed_state(int head_k_dim, int head_v
 
 static inline void linear_attention_hvx_update_packed_state(__fp16 *state, const float *k, const __fp16 *delta,
                                                             float decay, int head_k_dim, int head_v_dim) {
-  const int k_tiles = head_k_dim / 32;
-  const int n_tiles = head_v_dim / 32;
-  // Scalar fp32 accumulation: state = decay * state + k * delta in fp32,
-  // stored back as fp16. This avoids per-token fp16 rounding drift in the
-  // recurrent state that accumulates over long sequences.
+  const int        k_tiles = head_k_dim / 32;
+  const int        n_tiles = head_v_dim / 32;
+  const HVX_Vector v_decay = Q6_V_vsplat_R(fp32_bits(decay));
+  HVX_Vector       v_delta_lo[8];
+  HVX_Vector       v_delta_hi[8];
+  for (int nt = 0; nt < n_tiles; ++nt) {
+    _Alignas(128) __fp16 delta_pair[64];
+    for (int col = 0; col < 32; ++col) {
+      const __fp16 value      = delta[nt * 32 + col];
+      delta_pair[col * 2]     = value;
+      delta_pair[col * 2 + 1] = value;
+    }
+    const HVX_VectorPair v_delta = Q6_Wsf_vcvt_Vhf(Q6_Vh_vshuff_Vh(vmem(delta_pair)));
+    v_delta_lo[nt]               = Q6_V_lo_W(v_delta);
+    v_delta_hi[nt]               = Q6_V_hi_W(v_delta);
+  }
   for (int kt = 0; kt < k_tiles; ++kt) {
     for (int row_pair = 0; row_pair < 16; ++row_pair) {
-      const int   row0 = kt * 32 + row_pair * 2;
-      // The packed layout pairs two k rows (row0, row0+1) with the 64-lane
-      // state tile: low half = k[row0], high half = k[row0+1] for every lane.
-      const float k0   = k[row0];
-      const float k1   = k[row0 + 1];
+      const int            row0   = kt * 32 + row_pair * 2;
+      const uint32_t       k_pair = (uint32_t) hmx_fp16_bits(k[row0]) | ((uint32_t) hmx_fp16_bits(k[row0 + 1]) << 16);
+      const HVX_VectorPair v_k    = Q6_Wsf_vcvt_Vhf(Q6_Vh_vshuff_Vh(Q6_V_vsplat_R((int) k_pair)));
       for (int nt = 0; nt < n_tiles; ++nt) {
-        const size_t tile_base = ((size_t) nt * k_tiles + kt) * 1024 + row_pair * 64;
-        __fp16      *s         = state + tile_base;
-        for (int col = 0; col < 32; ++col) {
-          const float st0 = (float) s[col * 2];
-          const float st1 = (float) s[col * 2 + 1];
-          const float d   = (float) delta[nt * 32 + col];
-          s[col * 2]      = (__fp16) (decay * st0 + k0 * d);
-          s[col * 2 + 1]  = (__fp16) (decay * st1 + k1 * d);
-        }
+        const size_t         tile_base  = ((size_t) nt * k_tiles + kt) * 1024 + row_pair * 64;
+        const HVX_Vector     v_state    = vmemu(state + tile_base);
+        const HVX_VectorPair v_state_sf = Q6_Wsf_vcvt_Vhf(Q6_Vh_vshuff_Vh(v_state));
+        const HVX_Vector     out_lo     = Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(Q6_V_lo_W(v_state_sf), v_decay),
+                                                             Q6_Vsf_vmpy_VsfVsf(Q6_V_lo_W(v_k), v_delta_lo[nt]));
+        const HVX_Vector     out_hi     = Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(Q6_V_hi_W(v_state_sf), v_decay),
+                                                             Q6_Vsf_vmpy_VsfVsf(Q6_V_hi_W(v_k), v_delta_hi[nt]));
+        vmemu(state + tile_base)        = Q6_Vh_vdeal_Vh(Q6_Vhf_vcvt_VsfVsf(out_lo, out_hi));
       }
     }
   }
