@@ -77,6 +77,12 @@ enum DSPOpType {
   DSP_OP_VISION_ATTENTION_FP16                = 43,
   DSP_OP_VISION_FLASH_ATTENTION_FP16          = 44,
   DSP_OP_MATMUL_W8A16_GEMV_I8                 = 45,
+  // Non-causal attention with an explicit full K/V pair (no paged KV cache): Q rows and KV rows
+  // have independent lengths and GQA is applied internally. Used by the DFlash draft.
+  DSP_OP_CROSS_ATTENTION_FP16                 = 46,
+  // Row-wise argmax over fp16 input: for each of `rows` contiguous rows of `rowSize` elements,
+  // output the winning index (int32). Ties resolve to the lowest index.
+  DSP_OP_ARGMAX_FP16                          = 47,
   DSP_OP_COMMAND_GROUP                        = 99,
   DSP_OP_MAX                                  = 100
 };

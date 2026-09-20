@@ -96,6 +96,10 @@ extern AEEResult htp_ops_flash_attn_pages(uint8_t* o, uint8_t* q, uint8_t* k, ui
                                           int32 qo_len, int32 seq_current, int32 seq_add, int32 n_heads,
                                           int32 n_kv_heads, int32 head_dim, float scale, int32 mask_stride,
                                           int32 max_kv_len, int32 page_count, int32 page_size, int32 value_c4);
+extern AEEResult htp_ops_cross_attention_fp16(uint8_t* o, uint8_t* q, uint8_t* k, uint8_t* v, uint8_t* mask,
+                                              uint8_t* scratch, int32 batch, int32 q_tokens, int32 kv_tokens,
+                                              int32 n_heads, int32 n_kv_heads, int32 head_dim, float scale,
+                                              int32 mask_stride, int32 mask_is_fp16, int32 provided_scratch_bytes);
 extern AEEResult htp_ops_flash_attention_block(uint8_t* m_new, uint8_t* l_new, uint8_t* out_new,
                                                 uint8_t* q, uint8_t* k, uint8_t* v, uint8_t* mask,
                                                 uint8_t* running_m, uint8_t* running_l, uint8_t* running_out,
@@ -118,6 +122,7 @@ extern AEEResult htp_ops_shared_gather(uint8_t *dst, uint8_t *indices, uint8_t *
                                        int32 oc, int32 bytes, int32 isInt4, int32 scaleBlockNum, int32 scaleAsymmetric);
 extern AEEResult htp_ops_zero(uint8_t* dst, int32 size);
 extern AEEResult htp_ops_topkv2_k1_fp16(uint8_t* values, uint8_t* indices, uint8_t* input, int32 rowSize, int32 rows);
+extern AEEResult htp_ops_argmax_fp16(uint8_t* indices, const uint8_t* input, int32 rowSize, int32 rows);
 extern AEEResult htp_ops_softmax(uint8_t* dst, const uint8_t* src, int32 outside, int32 channel, int32 inside, int32 bytes);
 extern AEEResult htp_ops_reduction(uint8_t* dst, const uint8_t* src, int32 outside, int32 reduce, int32 inside, int32 type, int32 bytes);
 extern AEEResult htp_ops_masked_reduction(uint8_t* dst, const uint8_t* src, const uint8_t* mask, int32 outside, int32 reduce, int32 inside, int32 type, int32 bytes);
@@ -611,6 +616,12 @@ int htp_execute_command(MmapManager* mmap_manager, const DSPCOMMAND::Command* co
                                          intParams[0], intParams[1]);
             break;
         }
+        case DSP_OP_ARGMAX_FP16: {
+            ret = htp_ops_argmax_fp16(mapped_ptrs[inputs->size()],
+                                      mapped_ptrs[0],
+                                      intParams[0], intParams[1]);
+            break;
+        }
         case DSP_OP_SOFTMAX: {
             ret = htp_ops_softmax(mapped_ptrs[inputs->size()],
                                   mapped_ptrs[0],
@@ -732,6 +743,16 @@ int htp_execute_command(MmapManager* mmap_manager, const DSPCOMMAND::Command* co
             }
             ret = htp_ops_conv1x1_direct_fp16(mapped_ptrs[inputs->size()], mapped_ptrs[0], mapped_ptrs[1],
                                               mapped_ptrs[2], &im2colParams);
+            break;
+          }
+        case DSP_OP_CROSS_ATTENTION_FP16: {
+            ret = htp_ops_cross_attention_fp16(mapped_ptrs[inputs->size()], mapped_ptrs[0], mapped_ptrs[1],
+                                               mapped_ptrs[2],
+                                               inputs->size() > 3 ? mapped_ptrs[3] : nullptr,
+                                               mapped_ptrs[inputs->size() + 1],
+                                               intParams[0], intParams[1], intParams[2], intParams[3], intParams[4],
+                                               intParams[5], floatParams[6], intParams[7], intParams[8],
+                                               intParams[9]);
             break;
           }
         case DSP_OP_VISION_ATTENTION_FP16:
