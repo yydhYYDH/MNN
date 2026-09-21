@@ -18,6 +18,7 @@
 #include "MNN_generated.h"
 #include "core/FileLoader.hpp"
 #include "core/OpCommonUtils.hpp"
+#include "core/FusedProjCommon.hpp"
 
 namespace MNN {
 namespace Express {
@@ -105,6 +106,73 @@ static bool cloneBaseExecution(std::shared_ptr<Execution>& exe, const ExecutionC
     exe.reset(cloned.release());
     return true;
 }
+
+#ifdef MNN_SUPPORT_TRANSFORMER_FUSE
+// GeometryFusedProj decomposes a FusedLinear into member convolutions on the
+// backends that have no native execution. Pre-create those member executions
+// now (same idea as the top-level Convolution case below) so the member weights
+// are packed exactly once: the source session owns them and Session::clone
+// onClones them by name instead of letting every clone re-decompose and re-pack.
+static void precreateFusedProjMemberExecutions(Schedule::OpCacheInfo& info, const Op* op, Backend* backend,
+                                               Backend* backupBackend, FileLoader& loader) {
+    auto param = op->main_as_FusedLinearParam();
+    if (nullptr == param || nullptr == param->convs() || nullptr == op->name()) {
+        return;
+    }
+    const int numConvs  = (int)param->convs()->size();
+    const bool isGateUp = param->act_silu_mul();
+    if ((isGateUp && numConvs != 2) || (!isGateUp && (numConvs < 3 || numConvs > 4))) {
+        return;
+    }
+    const auto fmt = op->defaultDimentionFormat();
+    auto addMember = [&](int index, const std::string& role) {
+        std::string name = FusedProjCommon::memberName(op, role.c_str());
+        auto conv        = param->convs()->GetAs<Convolution2D>(index);
+        auto common      = nullptr == conv ? nullptr : conv->common();
+        if (name.empty() || nullptr == common) {
+            return;
+        }
+        std::shared_ptr<BufferStorage> storage = FusedProjCommon::makeConvOp(conv, fmt, nullptr, name);
+        const Op* memberOp                     = FusedProjCommon::opOf(storage);
+        std::shared_ptr<Tensor> tempInput(Tensor::createDevice<float>({1, common->inputCount(), 2, 2}));
+        std::shared_ptr<Tensor> tempOutput(Tensor::createDevice<float>({1, common->outputCount(), 2, 2}));
+        if (nullptr == tempInput || nullptr == tempOutput) {
+            return;
+        }
+        // channel() must read length(1); use the same NC4HW4 describe as the
+        // top-level Convolution case above (the tensors are only used to create
+        // the execution, real shapes arrive later via onResize).
+        TensorUtils::getDescribe(tempInput.get())->dimensionFormat  = MNN_DATA_FORMAT_NC4HW4;
+        TensorUtils::getDescribe(tempOutput.get())->dimensionFormat = MNN_DATA_FORMAT_NC4HW4;
+        std::shared_ptr<BufferStorage> tmpStorage;
+        std::shared_ptr<Execution> execution(OpCommonUtils::createExecutionWithExternal(
+            backend, {tempInput.get()}, {tempOutput.get()}, memberOp, &loader, tmpStorage));
+        if (nullptr == execution) {
+            execution.reset(OpCommonUtils::createExecutionWithExternal(backupBackend, {tempInput.get()},
+                                                                        {tempOutput.get()}, memberOp, &loader,
+                                                                        tmpStorage));
+        }
+        // Only keep cloneable executions: Session::clone onClones every entry.
+        if (nullptr == execution || !execution->onClone(nullptr, memberOp, nullptr)) {
+            return;
+        }
+        Schedule::OpCacheInfo::NamedExecution entry;
+        entry.op        = memberOp;
+        entry.storage   = storage;
+        entry.execution = execution;
+        info.namedExecutionCache.insert(
+            std::make_pair(std::make_tuple(name, (int)OpType_Convolution, (int)OpParameter_Convolution2D), entry));
+    };
+    if (isGateUp) {
+        addMember(0, "/gate");
+        addMember(1, "/up");
+    } else {
+        for (int i = 0; i < numConvs; ++i) {
+            addMember(i, "/qkv_" + std::to_string(i));
+        }
+    }
+}
+#endif
 
 static std::vector<std::shared_ptr<BufferStorage>> preRearrangeWeights( // NOLINT
     Schedule::ScheduleInfo& scheduleInfo, Backend* firstbackend, Backend* backupBackend, const Module::Config& config) {
@@ -283,10 +351,19 @@ static std::vector<std::shared_ptr<BufferStorage>> preRearrangeWeights( // NOLIN
             case MNN::OpType_FusedLinear: {
                 cloneBaseExecution(exe, base_executions, op, backend, backupBackend);
                 if (exe == nullptr) {
-                    // Pre-create only on backends with a native or composite
-                    // FusedLinear execution; the others decompose it in geometry.
-                    if (backend->type() != MNN_FORWARD_METAL && backend->type() != MNN_FORWARD_OPENCL &&
-                        backend->type() != MNN_FORWARD_CPU && backend->type() != MNN_FORWARD_CPU_EXTENSION) {
+                    // Pre-create only on backends that can hold a native or composite
+                    // FusedLinear execution, or an eagerly packed geometry decomposition.
+                    // Metal / OpenCL / CPU / CPU_EXTENSION keep the op and let it clone
+                    // natively; the other decomposing backends pre-create the member conv
+                    // executions here (weights packed once, shared across Session::clone)
+                    // and leave the op whole for geometry. Vulkan / CUDA may keep it whole
+                    // via their composite path, so leave those to the existing lazy behaviour.
+                    const auto backendType = backend->type();
+                    if (backendType != MNN_FORWARD_METAL && backendType != MNN_FORWARD_OPENCL &&
+                        backendType != MNN_FORWARD_CPU && backendType != MNN_FORWARD_CPU_EXTENSION) {
+                        if (backendType != MNN_FORWARD_VULKAN && backendType != MNN_FORWARD_CUDA) {
+                            precreateFusedProjMemberExecutions(info, op, backend, backupBackend, loader);
+                        }
                         break;
                     }
                     std::shared_ptr<BufferStorage> tmpstorage;
