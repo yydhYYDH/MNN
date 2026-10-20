@@ -1109,10 +1109,17 @@ HexagonConvolution* HexagonConvolution::create(Backend *backend, const Op* op) {
         res->int4LayoutType = int4LayoutType;
         res->int4ScaleBlockNum = int4ScaleBlockNum;
         res->int4ScaleAsymmetric = scaleAsymmetric;
+        // The kernel itself needs K % 64 == 0 and kp % scaleBlockNum == 0 (see
+        // hmx_matmulq4block_gemv_i8); it rejects the call and leaves the output untouched otherwise,
+        // so mirror both conditions here and fall back to the HMX path when they fail.
+        // Keep the v81 gate: once useGemvI8 is true, the M>1 BLOCK_FP16 command picks pathA
+        // (vrmpy-packed weights, weight_is_vrmpy=1). That packed layout is only profitable (and
+        // only validated) on v81+; on v79 it poisons the HMX verify path (DFlash target forward
+        // ~1.6x slower, measured 2026-10-20, see .artifacts/bisect-20261020/PLAN.md).
         const int hvxArch = static_cast<const HexagonRuntime*>(backend->getRuntime())->info().hvxArch;
-        const bool gemvShapeOk = dequantInWeight && (ic % 32 == 0) && (oc % 32 == 0) && (ic % 64 == 0) &&
+        const bool gemvShapeOk = dequantInWeight && hvxArch >= 81 && (ic % 64 == 0) && (oc % 32 == 0) &&
                                  ((ic / 32) % int4ScaleBlockNum == 0);
-        if (hvxArch >= 81 && gemvShapeOk) {
+        if (gemvShapeOk) {
             const size_t gemvWeightBytes = (size_t)icP * ocP * 512;
             // Asymmetric entries are 32 fp32 scale + 32 fp32 qbias, so one scale DMA covers both.
             const size_t gemvScaleBytes =
