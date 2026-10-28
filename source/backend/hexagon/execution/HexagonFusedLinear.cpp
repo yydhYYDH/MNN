@@ -40,7 +40,7 @@ HexagonFusedLinear* HexagonFusedLinear::create(Backend* backend, const Op* op, c
     auto param = op->main_as_FusedLinearParam();
     // Same predicate as GeometryFusedProj::_keepWhole: an op kept whole that this refused would fail
     // session creation. Every member then has a regular Hexagon execution, so creation succeeds.
-    if (param == nullptr || !FusedProjCommon::compositeEnvelopeOk(op, inputs.size(), outputs.size())) {
+    if (param == nullptr || !FusedProjCommon::compositeEnvelopeOkHexagon(op, inputs.size(), outputs.size())) {
         return nullptr;
     }
     const auto fmt = op->defaultDimentionFormat();

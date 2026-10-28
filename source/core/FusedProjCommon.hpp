@@ -187,6 +187,36 @@ inline bool compositeEnvelopeOk(const Op* op, size_t numInputs, size_t numOutput
     return nativeEnvelopeOk(op, numInputs, numOutputs) && allMembersAre1x1(op) && membersIntQuantOk(op);
 }
 
+// Hexagon's child conv reads float weights through ConvolutionCommon::load, so an
+// unquantized or fp16 member is safe there; membersIntQuantOk exists for Vulkan's
+// fp16 creator branches and Metal's scaleInt refusal, neither of which Hexagon has.
+inline bool membersFloatOrIntQuantOk(const Op* op) {
+    auto param = op->main_as_FusedLinearParam();
+    if (nullptr == param || nullptr == param->convs()) {
+        return false;
+    }
+    for (int i = 0; i < (int)param->convs()->size(); ++i) {
+        auto conv = param->convs()->GetAs<Convolution2D>(i);
+        auto quan = conv->quanParameter();
+        if (nullptr == quan) {
+            // Plain float weights.
+            continue;
+        }
+        if (quan->type() == 3) {
+            // fp16 weights: loaded as weightFloat, which HexagonConvolution handles.
+            continue;
+        }
+        if (quan->type() != 1 || quan->has_scaleInt()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline bool compositeEnvelopeOkHexagon(const Op* op, size_t numInputs, size_t numOutputs) {
+    return nativeEnvelopeOk(op, numInputs, numOutputs) && allMembersAre1x1(op) && membersFloatOrIntQuantOk(op);
+}
+
 } // namespace FusedProjCommon
 } // namespace MNN
 

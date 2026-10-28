@@ -64,9 +64,10 @@ class GeometryFusedProj : public GeometryComputer {
                    FusedProjCommon::nativeEnvelopeOk(op, numInputs, numOutputs);
         }
         // Hexagon always drives the members as child executions (the composite path is unconditional),
-        // so it decides by type like Metal / OpenCL rather than asking the runtime.
+        // so it decides by type like Metal / OpenCL rather than asking the runtime. Its child conv
+        // also takes float / fp16 members, which is what an unquantized draft graph is made of.
         if (context.forwardType() == MNN_FORWARD_HEXAGON) {
-            return FusedProjCommon::compositeEnvelopeOk(op, numInputs, numOutputs);
+            return FusedProjCommon::compositeEnvelopeOkHexagon(op, numInputs, numOutputs);
         }
         // Vulkan (buffer variant) and CUDA also drive the members as child executions, but the runtime
         // says whether that composite path is compiled in (image-variant Vulkan answers 0).

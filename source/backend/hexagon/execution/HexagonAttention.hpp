@@ -2,6 +2,7 @@
 #define HexagonAttention_hpp
 
 #include "core/OpCommonUtils.hpp"
+#include "MNN_generated.h"
 #include "HexagonExecution.hpp"
 #include "HexagonKVCacheManager.hpp"
 
@@ -13,6 +14,14 @@ public:
     virtual ~HexagonAttention();
     virtual bool onClone(Backend* bn, const Op* op, Execution** dst) override;
     static Execution* create(Backend* backend, const Op* op) {
+        // The DSP path reads K/V out of a paged KV cache, so every kernel here assumes the
+        // NC4HW4 cache layout. A cacheless attention (a block-diffusion draft attends a whole
+        // context in one shot) arrives as plain NCHW and has no matching kernel; refuse it at
+        // creation so the op falls back instead of failing session resize.
+        auto param = op == nullptr ? nullptr : op->main_as_AttentionParam();
+        if (param != nullptr && !param->kv_cache()) {
+            return nullptr;
+        }
         return new HexagonAttention(backend, op);
     }
 private:

@@ -208,9 +208,13 @@ ErrorCode HexagonAttention::onBuildCmd(const std::vector<Tensor *> &inputs, cons
                                        std::vector<HexagonCommand>& dst) {
     mVisionState = false;
     const bool streamingState = inputs.size() == 7 && outputs.size() == 3;
+    // Vision attends every query to every key of the same image. A block-diffusion draft also
+    // arrives as four NCHW fp16 tensors, but its queries (the block) are fewer than its keys
+    // (context + block), so the equal-sequence test is what separates the two layouts.
     const bool visionState = inputs.size() == 4 && outputs.size() == 1 && inputs[0] != nullptr &&
                              inputs[1] != nullptr && inputs[2] != nullptr && inputs[0]->dimensions() == 4 &&
                              inputs[1]->dimensions() == 4 && inputs[2]->dimensions() == 4 &&
+                             inputs[0]->length(1) == inputs[1]->length(1) &&
                              TensorUtils::getDescribe(inputs[2])->dimensionFormat != MNN_DATA_FORMAT_NC4HW4;
     if (visionState) {
         mVisionState = true;
