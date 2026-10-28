@@ -413,3 +413,5 @@ apps/iOS/MNNLLMChat/MNNLLMiOS/LocalModel/Qwen2.5-Omni-3B-MNN
 /resource/model/**/*.caffe.mnn
 
 model/
+# Fetched on demand by source/backend/cuda/CMakeLists.txt
+3rd_party/cutlass/
